@@ -1,0 +1,608 @@
+services:
+  # Kafka (KRaft mode - no ZooKeeper needed)
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      # Tăng timeout để tránh lỗi NotLeader trên máy chậm
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "true"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - lakehouse
+
+  # MinIO S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    hostname: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+
+  # MinIO client for bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc mb myminio/lakehouse --ignore-existing;
+      /usr/bin/mc mb myminio/checkpoints --ignore-existing;
+      /usr/bin/mc anonymous set public myminio/lakehouse;
+      /usr/bin/mc anonymous set public myminio/checkpoints;
+      exit 0;
+      "
+    networks:
+      - lakehouse
+
+  # Kafka topic initialization
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic raw.gate --partitions 3 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic raw.yard_move --partitions 3 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic raw.inspection --partitions 3 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic raw.cleaning --partitions 3 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic raw.mnr --partitions 3 --replication-factor 1;
+      echo 'Kafka topics created successfully';
+      exit 0;
+      "
+    networks:
+      - lakehouse
+
+  # Kafka UI for monitoring
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - DYNAMIC_CONFIG_ENABLED=true
+    networks:
+      - lakehouse
+
+  # Spark Master
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "8080:8080"  # Spark Master UI (required)
+      - "7077:7077"  # Spark Master port (required)
+    command: /opt/spark/sbin/start-master.sh
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+      - ./spark/jars:/opt/spark-jars
+      - spark-data:/opt/spark-data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - lakehouse
+
+  # Spark Worker (SCALED UP)
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: spark-worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_WORKER_MEMORY=6G  # Increased from 4G
+      - SPARK_WORKER_CORES=4
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+      - ./spark/jars:/opt/spark-jars
+      - spark-data:/opt/spark-data
+    networks:
+      - lakehouse
+
+  # Spark Job Submitter (custom container with dependencies)
+  spark-submit:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-submit
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+      - ./spark/jars:/opt/spark-jars
+      - spark-data:/opt/spark-data
+    command: tail -f /dev/null
+    networks:
+      - lakehouse
+
+  # Bronze+Silver Streaming Pipeline (TUNED)
+  spark-stream-bronze-silver:
+    profiles: ["apps"]
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-stream-bronze-silver
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+      - ./spark/jars:/opt/spark-jars
+      - ./spark/conf:/opt/spark/conf
+      - spark-data:/opt/spark-data
+    command: >
+      spark-submit
+      --master spark://spark-master:7077
+      --deploy-mode client
+      --total-executor-cores 2
+      --executor-memory 3G
+      --executor-cores 2
+      --driver-memory 2G
+      --conf spark.network.timeout=600s
+      --conf spark.executor.heartbeatInterval=30s
+      --conf spark.executor.memoryFraction=0.8
+      --conf spark.databricks.delta.optimizeWrite.enabled=true
+      --conf spark.databricks.delta.autoCompact.enabled=true
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+      --conf spark.hadoop.fs.s3a.access.key=${MINIO_ROOT_USER}
+      --conf spark.hadoop.fs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.hadoop.fs.s3a.connection.maximum=100
+      --conf spark.driver.extraJavaOptions=-Dlog4j.configuration=file:/opt/spark/conf/log4j.properties
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,io.delta:delta-spark_2.12:3.1.0,org.apache.hadoop:hadoop-aws:3.3.4
+      /opt/spark-jobs/stream_ingest_bronze_silver.py
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # Gold Operational Streaming Pipeline (TUNED)
+  spark-stream-gold-ops:
+    profiles: ["apps"]
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-stream-gold-ops
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      spark-stream-bronze-silver:
+        condition: service_started
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+      - ./spark/jars:/opt/spark-jars
+      - ./spark/conf:/opt/spark/conf
+      - spark-data:/opt/spark-data
+    command: >
+      spark-submit
+      --master spark://spark-master:7077
+      --deploy-mode client
+      --total-executor-cores 2
+      --executor-memory 3G
+      --executor-cores 2
+      --driver-memory 2G
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+      --conf spark.hadoop.fs.s3a.access.key=${MINIO_ROOT_USER}
+      --conf spark.hadoop.fs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.hadoop.fs.s3a.connection.maximum=100
+      --conf spark.network.timeout=600s
+      --conf spark.executor.heartbeatInterval=30s
+      --conf spark.executor.memoryFraction=0.8
+      --conf spark.driver.extraJavaOptions=-Dlog4j.configuration=file:/opt/spark/conf/log4j.properties
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,io.delta:delta-spark_2.12:3.1.0,org.apache.hadoop:hadoop-aws:3.3.4
+      /opt/spark-jobs/stream_gold_ops.py
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # Batch KPI Pipeline (scheduled every 15 minutes)
+  spark-kpi-batch:
+    profiles: ["apps"]
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-kpi-batch
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      spark-stream-gold-ops:
+        condition: service_started
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./spark/jobs:/opt/spark-jobs
+      - ./spark/jars:/opt/spark-jars
+      - ./spark/conf:/opt/spark/conf
+      - spark-data:/opt/spark-data
+    command:
+      - bash
+      - -c
+      - |
+        # echo 'Waiting 2 minutes for Gold tables to be populated...'
+        # sleep 120
+        while true; do 
+          echo '======================================'
+          echo "Starting batch KPI computation at $$(date)"
+          echo '======================================'
+          spark-submit \
+            --master spark://spark-master:7077 \
+            --deploy-mode client \
+            --total-executor-cores 2 \
+            --conf spark.executor.memory=1g \
+            --conf spark.driver.memory=1g \
+            --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+            --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+            --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+            --conf spark.hadoop.fs.s3a.access.key=${MINIO_ROOT_USER} \
+            --conf spark.hadoop.fs.s3a.secret.key=${MINIO_ROOT_PASSWORD} \
+            --conf spark.hadoop.fs.s3a.path.style.access=true \
+            --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+            --conf spark.driver.extraJavaOptions=-Dlog4j.configuration=file:/opt/spark/conf/log4j.properties \
+            --packages io.delta:delta-spark_2.12:3.1.0,org.apache.hadoop:hadoop-aws:3.3.4 \
+            /opt/spark-jobs/batch_kpi.py
+          echo 'Batch KPI completed. Waiting 15 minutes...'
+          sleep 900
+        done
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # Trino Coordinator
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    hostname: trino
+    ports:
+      - "8081:8080"
+    depends_on:
+      minio:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+    environment:
+      - TRINO_ENVIRONMENT=production
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/config:/etc/trino
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/v1/info || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+    networks:
+      - lakehouse
+  
+  # PostgreSQL for Superset metadata
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+
+  # PostgreSQL for Hive Metastore
+  metastore-db:
+    image: postgres:15-alpine
+    container_name: metastore-db
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive123
+    volumes:
+      - metastore-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+
+  # Hive Metastore (The "Central Ledger")
+  hive-metastore:
+    build:
+      context: ./hive
+      dockerfile: Dockerfile
+    container_name: hive-metastore
+    environment:
+      - METASTORE_DB_TYPE=postgres
+      - METASTORE_DB_HOSTNAME=metastore-db
+      - METASTORE_DB_PORT=5432
+      - METASTORE_DB_NAME=metastore
+      - METASTORE_DB_USER=hive
+      - METASTORE_DB_PASSWORD=hive123
+    ports:
+      - "9083:9083"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9083"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      metastore-db:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # Trino init (register Delta tables in HMS)
+  trino-init:
+    image: python:3.11-slim
+    container_name: trino-init
+    depends_on:
+      trino:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - TRINO_URL=http://trino:8080
+      - TRINO_USER=admin
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_BUCKET=lakehouse
+      - MINIO_GOLD_PREFIX=gold
+    volumes:
+      - ./scripts/trino:/scripts/trino
+      - ./init/trino:/init/trino
+    entrypoint: ["python", "/scripts/trino/trino_init.py"]
+    restart: "no"
+    networks:
+      - lakehouse
+
+  # Catalog sync (optional, periodic registration)
+  catalog-sync:
+    image: python:3.11-slim
+    container_name: catalog-sync
+    depends_on:
+      trino:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - TRINO_URL=http://trino:8080
+      - TRINO_USER=admin
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_BUCKET=lakehouse
+      - MINIO_GOLD_PREFIX=gold
+      - SYNC_INTERVAL_SECONDS=60
+    volumes:
+      - ./scripts/trino:/scripts/trino
+    entrypoint: ["python", "/scripts/trino/catalog_sync.py"]
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+
+  # Redis for Superset caching
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+
+  # Apache Superset
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    hostname: superset
+    ports:
+      - "8088:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+    environment:
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+      - ./scripts:/scripts
+      - superset-data:/app/superset_home
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8088/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - lakehouse
+  
+  # Superset Initialization (runs once)
+  superset-init:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset-init
+    depends_on:
+      superset:
+        condition: service_healthy
+    environment:
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./scripts:/scripts
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+      - superset-data:/app/superset_home
+    entrypoint: /bin/bash
+    command: /scripts/init-superset.sh
+    networks:
+      - lakehouse
+
+  # Python Producer (Interactive - for manual runs)
+  producer:
+    profiles: ["apps"]
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - ./data:/app/data
+      - ./producer:/app
+    command: tail -f /dev/null
+    networks:
+      - lakehouse
+
+  # Streaming Producer (Continuous data feed)
+  producer-stream:
+    profiles: ["apps"]
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: producer-stream
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    volumes:
+      - ./data:/app/data
+      - ./producer:/app
+    command: python producer.py --mode loop --interval 30 --limit 300
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+volumes:
+  kafka-data:
+  minio-data:
+  postgres-data:
+  metastore-db-data:
+  spark-data:
+  superset-data:
+
+networks:
+  lakehouse:
+    driver: bridge
