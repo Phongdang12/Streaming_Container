@@ -1,5 +1,32 @@
 # 📉 QUY TRÌNH CHẠY TIẾT KIỆM TÀI NGUYÊN (LOCAL MODE)
 
+
+
+## 🛠️ CÔNG CỤ HỖ TRỢ (Dọn dẹp & Sửa lỗi)
+
+Nếu gặp lỗi full ổ cứng hoặc muốn reset toàn bộ:
+
+```powershell
+# Fix lỗi Docker hết chỗ (Prune system)
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; .\fix_docker_space.ps1
+
+# Xóa sạch dữ liệu và containers cũ (Reset all)
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; Set-Location "C:\Users\Admin\OneDrive\Documents\Project TTNT"; .\cleanup_all.ps1
+```
+
+## 📊 CÀI ĐẶT DASHBOARD TỰ ĐỘNG
+
+Nếu dashboard chưa hiện trên Superset, chạy lệnh sau:
+
+```powershell
+# Cài thư viện python requests (dùng python -m để tránh lỗi path)
+python -m pip install requests
+
+# Chạy script deploy dashboard
+python scripts/deploy_superset_dashboard.py
+```
+
+
 > **Mục tiêu**: Chạy được hệ thống Big Data phức tạp trên máy tính cá nhân (RAM 8GB-16GB) mà không bị treo máy hay crash Docker.
 > **Nguyên tắc**: Chạy tuần tự (Sequential) thay vì chạy song song (Parallel).
 
