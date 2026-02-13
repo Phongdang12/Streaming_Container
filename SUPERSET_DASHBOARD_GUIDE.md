@@ -18,7 +18,6 @@ Trước khi vẽ, hãy đảm bảo Trino đã nhận diện đủ **7 bảng v
    - `gold_backlog_metrics`
    - `gold_container_current_status`
    - `gold_container_cycle`
-   - `gold_kpi_daily`
    - `gold_kpi_peak_hours` (New)
    - `gold_kpi_shift` (New)
    - `gold_ops_metrics_realtime`

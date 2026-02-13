@@ -2,6 +2,9 @@
 
 > **Workflow thực tế**: Infrastructure setup 1 lần (Automated) → Chạy processing jobs từng bước (Manual Control)
 
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; .\fix_docker_space.ps1
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; Set-Location "C:\Users\Admin\OneDrive\Documents\Project TTNT"; .\cleanup_all.ps1
 ---
 
 ## 🏗️ KIẾN TRÚC MỚI: AUTOMATED HIVE METASTORE
