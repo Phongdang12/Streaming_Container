@@ -6,3 +6,5 @@ CALL delta.system.register_table(schema_name => 'lakehouse', table_name => 'gold
 CALL delta.system.register_table(schema_name => 'lakehouse', table_name => 'gold_kpi_shift', table_location => 's3://lakehouse/gold/gold_kpi_shift');
 CALL delta.system.register_table(schema_name => 'lakehouse', table_name => 'gold_kpi_daily', table_location => 's3://lakehouse/gold/gold_kpi_daily');
 CALL delta.system.register_table(schema_name => 'lakehouse', table_name => 'gold_kpi_peak_hours', table_location => 's3://lakehouse/gold/gold_kpi_peak_hours');
+CALL delta.system.register_table(schema_name => 'lakehouse', table_name => 'gold_inspection_summary', table_location => 's3://lakehouse/gold/gold_inspection_summary');
+CALL delta.system.register_table(schema_name => 'lakehouse', table_name => 'gold_yard_move_summary', table_location => 's3://lakehouse/gold/gold_yard_move_summary');

@@ -41,6 +41,12 @@ while ($elapsed -lt $maxWait) {
     Write-Host "." -NoNewline -ForegroundColor Gray
 }
 
+if (-not $allHealthy) {
+    Write-Host ""
+    Write-Host "⚠️  WARNING: Not all services became healthy within $maxWait seconds." -ForegroundColor Yellow
+    Write-Host "   Check logs with: docker-compose logs --tail=30" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
@@ -66,9 +72,7 @@ Write-Host ""
 Write-Host "Terminal 3 - Start Gold Spark Job:" -ForegroundColor Yellow
 Write-Host "  docker-compose up spark-stream-gold-ops" -ForegroundColor White
 Write-Host ""
-Write-Host "Terminal 4 - Monitor Data Flow:" -ForegroundColor Yellow
-Write-Host "  .\scripts\monitor-flow.ps1" -ForegroundColor White
-Write-Host ""
+
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "URLs:" -ForegroundColor Cyan
 Write-Host "  Superset:  http://localhost:8088 (admin/admin)" -ForegroundColor White

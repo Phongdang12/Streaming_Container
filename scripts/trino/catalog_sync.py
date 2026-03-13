@@ -22,7 +22,10 @@ TABLES_WHITELIST = {
     "gold_ops_metrics_realtime",
     "gold_backlog_metrics",
     "gold_kpi_shift",
+    "gold_kpi_daily",
     "gold_kpi_peak_hours",
+    "gold_inspection_summary",
+    "gold_yard_move_summary",
 }
 
 
@@ -97,6 +100,18 @@ def trino_execute(sql: str) -> None:
     _ = trino_query(sql)
 
 
+def unregister_table(table: str) -> None:
+    sql = (
+        "CALL delta.system.unregister_table("
+        f"schema_name => '{TRINO_SCHEMA}', "
+        f"table_name => '{table}')"
+    )
+    try:
+        trino_execute(sql)
+    except Exception:
+        pass  # table wasn't registered — that's fine
+
+
 def register_table(table: str) -> None:
     location = f"s3://{MINIO_BUCKET}/{MINIO_GOLD_PREFIX}/{table}"
     sql = (
@@ -116,6 +131,13 @@ def register_table(table: str) -> None:
         raise
 
 
+def force_refresh_table(table: str) -> None:
+    """Unregister then re-register to clear stale Trino metadata after overwrites."""
+    unregister_table(table)
+    register_table(table)
+    log(f"Refreshed metadata for {table}")
+
+
 def main() -> None:
     log("Starting catalog sync loop...")
     while True:
@@ -132,6 +154,9 @@ def main() -> None:
             for table in tables:
                 if table not in existing:
                     register_table(table)
+                else:
+                    # Always force-refresh to clear stale metadata from batch overwrites.
+                    force_refresh_table(table)
         except Exception as exc:
             log(f"catalog-sync error: {exc}")
         time.sleep(SYNC_INTERVAL_SECONDS)

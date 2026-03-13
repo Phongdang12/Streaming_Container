@@ -4,12 +4,13 @@ Gold KPI Batch Aggregations (Shift + Daily Rolling + Utilization)
 Redesigned for long-dwell port operations:
 - Replaces hourly KPIs with shift-based KPIs (MORNING/AFTERNOON/NIGHT)
 - Adds rolling trends for daily KPIs (7d throughput avg, 30d dwell avg)
-- Normalizes facility to terminal code (CT01/CT02/CT03/CT04) to prevent "facility == location" skew
+- Facility normalization (CT01/CT02/CT03/CT04) is handled upstream in Silver
 """
 from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta
 
 from delta.tables import DeltaTable
 from pyspark.sql import SparkSession, DataFrame
@@ -17,36 +18,17 @@ from pyspark.sql.window import Window
 from pyspark.sql.functions import (
     col, lit, when, coalesce, current_timestamp,
     count, countDistinct, sum as _sum, avg, min as _min, max as _max,
-    to_date, date_sub, hour, regexp_extract, upper, trim, expr,
-    percentile_approx
+    to_date, date_sub, hour, expr,
+    percentile_approx, lpad,
+    upper, trim,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-HMS_REGISTER_ENABLED = os.environ.get("HMS_REGISTER_ENABLED", "false").lower() == "true"
-
-
 # -----------------------
 # Helpers
 # -----------------------
-def register_table_to_metastore(spark: SparkSession, table_name: str, delta_path: str) -> None:
-    """Register Delta table to Hive Metastore (optional; off by default)."""
-    if not HMS_REGISTER_ENABLED:
-        logger.info("Skipping Spark HMS registration (HMS_REGISTER_ENABLED=false)")
-        return
-    try:
-        spark.sql("CREATE DATABASE IF NOT EXISTS lakehouse")
-        spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS lakehouse.{table_name}
-            USING DELTA
-            LOCATION '{delta_path}'
-        """)
-        logger.info(f"Registered lakehouse.{table_name} -> {delta_path}")
-    except Exception as e:
-        logger.warning(f"HMS registration skipped/failed for {table_name}: {e}")
-
-
 def create_spark_session() -> SparkSession:
     """Create Spark session for KPI batch processing."""
     return (
@@ -57,24 +39,8 @@ def create_spark_session() -> SparkSession:
         .config("spark.databricks.delta.autoCompact.enabled", "true")
         .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
         .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8"))
-        .enableHiveSupport()
         .getOrCreate()
     )
-
-
-def norm_facility_expr(fac_col) -> "Column":
-    """
-    Normalize any facility/location-like string to terminal code CTxx.
-    Examples:
-      - 'CT01-A-5-4' -> 'CT01'
-      - 'CT03-MNR-SHOP-1' -> 'CT03'
-      - 'ct02' -> 'CT02'
-    """
-    return when(
-        fac_col.isNull(), lit(None).cast("string")
-    ).otherwise(
-        regexp_extract(upper(trim(fac_col.cast("string"))), r"(CT\d{2})", 1)
-    ).alias("facility")
 
 
 def add_shift_columns(df: DataFrame, ts_col: str) -> DataFrame:
@@ -95,45 +61,84 @@ def add_shift_columns(df: DataFrame, ts_col: str) -> DataFrame:
 
 
 # -----------------------
+# Analytics Reference Time
+# -----------------------
+def get_dataset_now(spark: SparkSession) -> datetime:
+    """
+    Derive the analytics reference time = max(event_time) from silver_container_events.
+
+    Rules:
+    - NEVER returns wall-clock time.
+    - silver_container_events is the single source of truth.
+    - Raises RuntimeError immediately if the canonical table is unavailable or empty,
+      so callers fail loudly rather than silently producing wrong KPIs.
+    - All rolling windows, open-inventory bounds, and dwell calculations are anchored
+      to this value — re-running the job against the same Silver data on a different
+      calendar day produces identical Gold output.
+    """
+    canonical_path = "s3a://lakehouse/silver/silver_container_events"
+    try:
+        row = (
+            spark.read.format("delta")
+            .load(canonical_path)
+            .agg(_max("event_time").alias("max_ts"))
+            .collect()[0]
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot derive dataset_now: silver_container_events is unavailable ({exc}). "
+            "Ensure spark-stream-bronze-silver has processed at least one batch."
+        ) from exc
+
+    if row["max_ts"] is None:
+        raise RuntimeError(
+            "Cannot derive dataset_now: silver_container_events exists but contains no events. "
+            "Ensure spark-stream-bronze-silver has processed at least one batch."
+        )
+
+    dataset_now: datetime = row["max_ts"]
+    logger.info(f"dataset_now = {dataset_now}  (max event_time from silver_container_events)")
+    return dataset_now
+
+
+# -----------------------
 # Shift KPIs (replaces hourly)
 # -----------------------
-def compute_shift_kpis(spark: SparkSession, lookback_days: int = 30) -> None:
+def compute_shift_kpis(spark: SparkSession, lookback_days: int = 30, dataset_now: datetime = None) -> None:
     """
     Outputs: gold_kpi_shift (long format)
-      facility, operational_date, shift_id, kpi_type, value, computed_at
+      facility, operational_date, shift_id, kpi_type, value, computed_at, data_as_of
         - SHIFT_GATE_IN
         - SHIFT_GATE_OUT
         - SHIFT_YARD_MOVES
+
+    dataset_now: analytics reference time (max event_time_parsed from Silver).
+                 All window bounds are anchored to this value — never to wall clock.
     """
     lookback_days = int(max(1, lookback_days))
-    logger.info(f"Computing shift KPIs (lookback: {lookback_days} days)")
+    if dataset_now is None:
+        dataset_now = get_dataset_now(spark)
+    logger.info(f"Computing shift KPIs (lookback: {lookback_days} days, dataset_now: {dataset_now})")
 
-    gate = (
+    dataset_now_ts = lit(dataset_now).cast("timestamp")
+    lookback_start_ts = lit(dataset_now - timedelta(days=lookback_days)).cast("timestamp")
+
+    # Single read from canonical Silver instead of separate silver_gate_events and
+    # silver_yard_moves reads.  Canonical event_type values are exact — no variant
+    # string matching needed (GATE_IN / GATE_OUT / YARD_MOVE are the only values).
+    events = (
         spark.read.format("delta")
-        .load("s3a://lakehouse/silver/silver_gate_events")
-        .where(col("event_time_parsed") >= expr(f"current_date() - interval {lookback_days} days"))
-        .where(col("event_time_parsed") <= current_timestamp()) # Filter future dates
+        .load("s3a://lakehouse/silver/silver_container_events")
+        .where(col("event_type").isin("GATE_IN", "GATE_OUT", "YARD_MOVE"))
+        .where(col("event_time") >= lookback_start_ts)
+        .where(col("event_time") <= dataset_now_ts)
+        .where(col("facility").isNotNull())
+        .select("facility", "event_time", "event_type")
     )
-
-    # facility safeguard: prefer facility, else derive from location
-    gate = gate.withColumn(
-        "facility_raw", coalesce(col("facility"), col("location"))
-    ).withColumn(
-        "facility", norm_facility_expr(col("facility_raw"))
-    ).drop("facility_raw")
-
-    # Filter out invalid facilities that couldn't be normalized (e.g. empty strings)
-    gate = gate.where(col("facility").isNotNull() & (col("facility") != ""))
-
-    # robust event_type: prefer event_type_norm, else event_type
-    gate = gate.withColumn("event_type_norm", coalesce(col("event_type_norm"), col("event_type")))
-    gate = gate.select("facility", "event_time_parsed", upper(trim(col("event_type_norm"))).alias("event_type_norm"))
-
-    gate = gate.where(col("facility").isNotNull()).where(col("event_time_parsed").isNotNull())
-    gate_with_shift = add_shift_columns(gate, "event_time_parsed")
+    events_with_shift = add_shift_columns(events, "event_time")
 
     gate_in = (
-        gate_with_shift.where(col("event_type_norm").isin("GATE_IN", "GATEIN", "IN", "GATE-IN"))
+        events_with_shift.where(col("event_type") == "GATE_IN")  # canonical: single exact value
         .groupBy("facility", "operational_date", "shift_id")
         .agg(count("*").alias("cnt"))
         .withColumn("kpi_type", lit("SHIFT_GATE_IN"))
@@ -142,7 +147,7 @@ def compute_shift_kpis(spark: SparkSession, lookback_days: int = 30) -> None:
     )
 
     gate_out = (
-        gate_with_shift.where(col("event_type_norm").isin("GATE_OUT", "GATEOUT", "OUT", "GATE-OUT"))
+        events_with_shift.where(col("event_type") == "GATE_OUT")  # canonical: single exact value
         .groupBy("facility", "operational_date", "shift_id")
         .agg(count("*").alias("cnt"))
         .withColumn("kpi_type", lit("SHIFT_GATE_OUT"))
@@ -150,25 +155,20 @@ def compute_shift_kpis(spark: SparkSession, lookback_days: int = 30) -> None:
         .drop("cnt")
     )
 
-    yard = (
-        spark.read.format("delta")
-        .load("s3a://lakehouse/silver/silver_yard_moves")
-        .where(col("event_time_parsed") >= expr(f"current_date() - interval {lookback_days} days"))
-    )
-
-    yard = yard.withColumn("facility", norm_facility_expr(col("facility")))
-    yard = yard.select("facility", "event_time_parsed").where(col("facility").isNotNull()).where(col("event_time_parsed").isNotNull())
-    yard_with_shift = add_shift_columns(yard, "event_time_parsed")
-
     moves = (
-        yard_with_shift.groupBy("facility", "operational_date", "shift_id")
+        events_with_shift.where(col("event_type") == "YARD_MOVE")  # canonical: single exact value
+        .groupBy("facility", "operational_date", "shift_id")
         .agg(count("*").alias("cnt"))
         .withColumn("kpi_type", lit("SHIFT_YARD_MOVES"))
         .withColumn("value", col("cnt").cast("long"))
         .drop("cnt")
     )
 
-    all_shift = gate_in.unionByName(gate_out).unionByName(moves).withColumn("computed_at", current_timestamp())
+    all_shift = (
+        gate_in.unionByName(gate_out).unionByName(moves)
+        .withColumn("computed_at", current_timestamp())   # audit: when computation ran
+        .withColumn("data_as_of", dataset_now_ts)         # business: max event_time in Silver
+    )
 
     delta_path = "s3a://lakehouse/gold/gold_kpi_shift"
     try:
@@ -192,38 +192,48 @@ def compute_shift_kpis(spark: SparkSession, lookback_days: int = 30) -> None:
         all_shift.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(delta_path)
         logger.info(f"✅ Computed shift KPIs: {all_shift.count()} records (overwrite)")
 
-    register_table_to_metastore(spark, "gold_kpi_shift", delta_path)
-
 
 # -----------------------
 # Daily KPIs + rolling trends
 # -----------------------
-def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365) -> None:
+def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365, dataset_now: datetime = None) -> None:
     """
     Daily KPIs with rolling trends:
       - DAILY_THROUGHPUT: completed cycles per day (+ dwell stats)
       - DAILY_INVENTORY: end-of-day inventory snapshot (open-in-yard)
       - rolling_7d_avg_throughput: 7-day moving avg throughput (includes 0 days)
       - rolling_30d_avg_dwell: 30-day moving avg dwell (weighted by completed cycles)
+
+    dataset_now anchors the calendar, lookback bounds, and open-cycle inventory
+    upper boundary. Never uses wall-clock time.
     """
     lookback_days = int(max(7, lookback_days))
-    logger.info(f"Computing daily KPIs (lookback: {lookback_days} days)")
+    if dataset_now is None:
+        dataset_now = get_dataset_now(spark)
+    logger.info(f"Computing daily KPIs (lookback: {lookback_days} days, dataset_now: {dataset_now})")
 
     spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+
+    # Pre-compute all date/timestamp literals from dataset_now — no wall clock from here.
+    dataset_now_ts   = lit(dataset_now).cast("timestamp")
+    lb_ts            = lit(dataset_now - timedelta(days=lookback_days + 60)).cast("timestamp")
+    dn_date_str      = str(dataset_now.date())
+    lb_date_str      = str((dataset_now - timedelta(days=lookback_days)).date())
+    dn_date_expr     = expr(f"date '{dn_date_str}'")
+    lb_date_expr     = expr(f"date '{lb_date_str}'")
 
     cycles = (
         spark.read.format("delta")
         .load("s3a://lakehouse/gold/gold_container_cycle")
         .where(col("gate_in_time").isNotNull())
-        .where(col("gate_in_time") <= current_timestamp()) # Filter future
+        .where(col("gate_in_time") <= dataset_now_ts)    # exclude future events
     )
 
-    # facility safeguard
-    cycles = cycles.withColumn("facility", norm_facility_expr(col("facility")))
-    cycles = cycles.where(col("facility").isNotNull() & (col("facility") != ""))
+    # facility: Gold cycle table inherits Silver's normalized CTxx facility
+    cycles = cycles.where(col("facility").isNotNull())
 
     # limit to history needed for rolling windows + calendar
-    cycles = cycles.where(col("gate_in_time") >= expr(f"current_date() - interval {lookback_days + 60} days"))
+    cycles = cycles.where(col("gate_in_time") >= lb_ts)
 
     # -------------------------
     # Daily throughput (CLOSED cycles by gate_out_date)
@@ -244,8 +254,9 @@ def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365) -> None:
     )
 
     facilities = cycles.select("facility").where(col("facility").isNotNull()).distinct()
+    # Calendar anchored to dataset_now — reproducible for same input regardless of run date.
     calendar = spark.sql(
-        f"SELECT explode(sequence(date_sub(current_date(), {lookback_days}), current_date(), interval 1 day)) AS operational_date"
+        f"SELECT explode(sequence(date '{lb_date_str}', date '{dn_date_str}', interval 1 day)) AS operational_date"
     )
     dense_days = facilities.crossJoin(calendar)
 
@@ -255,17 +266,22 @@ def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365) -> None:
         .withColumn("dwell_hours_sum", coalesce(col("dwell_hours_sum"), lit(0.0)))
     )
 
-    w7 = Window.partitionBy("facility").orderBy(col("operational_date")).rowsBetween(-6, 0)
+    w7  = Window.partitionBy("facility").orderBy(col("operational_date")).rowsBetween(-6, 0)
     w30 = Window.partitionBy("facility").orderBy(col("operational_date")).rowsBetween(-29, 0)
 
     daily_dense = (
         daily_dense
         .withColumn("rolling_7d_avg_throughput", avg(col("cycles_completed").cast("double")).over(w7))
-        .withColumn("rolling_30d_cycles", _sum(col("cycles_completed").cast("double")).over(w30))
-        .withColumn("rolling_30d_dwell_sum", _sum(col("dwell_hours_sum").cast("double")).over(w30))
+        .withColumn("rolling_30d_cycles",        _sum(col("cycles_completed").cast("double")).over(w30))
+        .withColumn("rolling_30d_dwell_sum",     _sum(col("dwell_hours_sum").cast("double")).over(w30))
+        # rolling_30d_avg_dwell: kept in HOURS (same unit as avg_dwell_hours / metric1)
+        # to avoid unit mismatch in the same Gold KPI row.
+        # Superset charts that want days should divide by 24 in the metric expression.
         .withColumn(
             "rolling_30d_avg_dwell",
-            when(col("rolling_30d_cycles") > 0, (col("rolling_30d_dwell_sum") / col("rolling_30d_cycles")) / lit(24.0)).otherwise(lit(None).cast("double"))
+            when(col("rolling_30d_cycles") > 0,
+                 col("rolling_30d_dwell_sum") / col("rolling_30d_cycles")
+            ).otherwise(lit(None).cast("double"))
         )
         .withColumn("day_ts", col("operational_date").cast("timestamp"))
         .drop("rolling_30d_cycles", "rolling_30d_dwell_sum")
@@ -282,13 +298,16 @@ def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365) -> None:
             lit(None).cast("string").alias("category"),
             col("rolling_7d_avg_throughput").cast("double").alias("rolling_7d_avg_throughput"),
             col("rolling_30d_avg_dwell").cast("double").alias("rolling_30d_avg_dwell"),
-            current_timestamp().alias("computed_at"),
+            current_timestamp().alias("computed_at"),    # audit: when computation ran
+            dataset_now_ts.alias("data_as_of"),          # business: max event_time in Silver
         )
     )
 
     # -------------------------
     # Daily inventory snapshot (end-of-day) from cycles
-    # Build by exploding date range per cycle, clipped to lookback window
+    # Build by exploding date range per cycle, clipped to lookback window.
+    # For OPEN cycles: dataset_now is the "today" upper boundary, making the
+    # result reproducible — the same data always produces the same inventory.
     # -------------------------
     inv_cycles = cycles.select(
         col("container_no_norm").alias("container_no_norm"),
@@ -297,27 +316,24 @@ def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365) -> None:
         to_date(col("gate_out_time")).alias("out_date"),
     )
 
-    # last day container is still in yard for snapshot:
-    # if out_date exists, exclude out_date itself -> out_date - 1
-    # FIX: Include same-day value (if in_date == out_date, we want it counted at least once).
-    # Changed from date_sub(col("out_date"), 1) to col("out_date") to prevent missing same-day cycles.
     inv_cycles = inv_cycles.withColumn(
         "last_in_yard_date",
-        when(col("out_date").isNotNull(), col("out_date")).otherwise(expr("current_date()"))
+        when(col("out_date").isNotNull(), col("out_date")).otherwise(dn_date_expr)
     )
 
-    # clip ranges to lookback window
+    # clip ranges to lookback window using dataset_now-anchored bounds
     inv_cycles = inv_cycles.withColumn(
         "range_start",
-        when(col("in_date") < date_sub(expr("current_date()"), lookback_days), date_sub(expr("current_date()"), lookback_days)).otherwise(col("in_date"))
+        when(col("in_date") < lb_date_expr, lb_date_expr).otherwise(col("in_date"))
     ).withColumn(
         "range_end",
-        when(col("last_in_yard_date") > expr("current_date()"), expr("current_date()")).otherwise(col("last_in_yard_date"))
+        when(col("last_in_yard_date") > dn_date_expr, dn_date_expr).otherwise(col("last_in_yard_date"))
     ).where(col("range_start") <= col("range_end"))
 
     daily_inventory_counts = (
         inv_cycles
-        .select("facility", "container_no_norm", expr("explode(sequence(range_start, range_end, interval 1 day))").alias("operational_date"))
+        .select("facility", "container_no_norm",
+                expr("explode(sequence(range_start, range_end, interval 1 day))").alias("operational_date"))
         .groupBy("facility", "operational_date")
         .agg(countDistinct("container_no_norm").alias("inventory_eod"))
         .withColumn("day_ts", col("operational_date").cast("timestamp"))
@@ -340,7 +356,8 @@ def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365) -> None:
             lit(None).cast("string").alias("category"),
             lit(None).cast("double").alias("rolling_7d_avg_throughput"),
             lit(None).cast("double").alias("rolling_30d_avg_dwell"),
-            current_timestamp().alias("computed_at"),
+            current_timestamp().alias("computed_at"),    # audit: when computation ran
+            dataset_now_ts.alias("data_as_of"),          # business: max event_time in Silver
         )
     )
 
@@ -368,44 +385,224 @@ def compute_daily_kpis(spark: SparkSession, lookback_days: int = 365) -> None:
         all_daily.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(delta_path)
         logger.info(f"✅ Computed daily KPIs: {all_daily.count()} records (overwrite)")
 
-    register_table_to_metastore(spark, "gold_kpi_daily", delta_path)
 
-
-def compute_peak_hour_analytics(spark: SparkSession, lookback_days: int = 60) -> None:
+def compute_peak_hour_analytics(spark: SparkSession, lookback_days: int = 60, dataset_now: datetime = None) -> None:
     """
-    NEW: Peak Hour Heatmap.
+    Peak Hour Heatmap.
     Aggregates activity by Day of Week (Mon-Sun) and Hour of Day (0-23).
     Useful for resource planning matrices.
+
+    dataset_now anchors the lookback window — never wall clock.
     """
-    logger.info(f"Computing peak hour analytics (lookback: {lookback_days} days)")
-    
-    # Read Gate Events
+    if dataset_now is None:
+        dataset_now = get_dataset_now(spark)
+    logger.info(f"Computing peak hour analytics (lookback: {lookback_days} days, dataset_now: {dataset_now})")
+
+    dataset_now_ts    = lit(dataset_now).cast("timestamp")
+    lookback_start_ts = lit(dataset_now - timedelta(days=lookback_days)).cast("timestamp")
+
+    # Read all gate events from canonical Silver (GATE_IN + GATE_OUT combined),
+    # replacing the direct silver_gate_events read.
+    # event_time is the canonical timestamp column (was event_time_parsed in source Silver).
+    # event_source == 'GATE' covers both GATE_IN and GATE_OUT together, which is
+    # the correct scope for total gate activity heatmap (arrival + departure pressure).
     gate = (
         spark.read.format("delta")
-        .load("s3a://lakehouse/silver/silver_gate_events")
-        .where(col("event_time_parsed") >= expr(f"current_date() - interval {lookback_days} days"))
+        .load("s3a://lakehouse/silver/silver_container_events")
+        .where(col("event_source") == "GATE")
+        .where(col("event_time") >= lookback_start_ts)
+        .where(col("event_time") <= dataset_now_ts)
+        .where(col("facility").isNotNull())
+        .select("facility", "event_time")
     )
-    
-    # Normalize
-    gate = gate.withColumn("facility", norm_facility_expr(coalesce(col("facility"), col("location"))))
-    gate = gate.where(col("facility").isNotNull() & col("event_time_parsed").isNotNull())
-    
+
     # Extract features
     from pyspark.sql.functions import date_format, hour, dayofweek
-    
-    # dayofweek: 1=Sunday, 2=Monday... pyspark convention
-    heatmap = (
-        gate.groupBy("facility", date_format("event_time_parsed", "EEEE").alias("day_name"), hour("event_time_parsed").alias("hour_of_day"))
+
+    # Aggregate raw counts per (facility, day_name, hour_of_day)
+    # day_name uses numeric prefix ("1-Mon"…"7-Sun") so that alphabetical sort in
+    # Superset's heatmap y-axis produces the correct Mon→Sun weekday progression.
+    # dayofweek: 1=Sunday, 2=Monday... pyspark convention → ISO offset: Mon=1, Sun=7.
+    heatmap_raw = (
+        gate.groupBy(
+            "facility",
+            when(date_format("event_time", "E") == "Mon", lit("1-Mon"))
+            .when(date_format("event_time", "E") == "Tue", lit("2-Tue"))
+            .when(date_format("event_time", "E") == "Wed", lit("3-Wed"))
+            .when(date_format("event_time", "E") == "Thu", lit("4-Thu"))
+            .when(date_format("event_time", "E") == "Fri", lit("5-Fri"))
+            .when(date_format("event_time", "E") == "Sat", lit("6-Sat"))
+            .otherwise(lit("7-Sun")).alias("day_name"),
+            lpad(hour("event_time").cast("string"), 2, "0").alias("hour_of_day"),
+        )
         .agg(count("*").alias("total_activity"))
-        .withColumn("avg_activity", col("total_activity") / lit(lookback_days / 7)) # Approx avg per specific weekday
-        .withColumn("kpi_type", lit("PEAK_HEATMAP"))
-        .withColumn("computed_at", current_timestamp())
     )
-    
+
+    # Build a complete 7-days × 24-hours grid per facility so the Superset heatmap
+    # shows ALL cells (not just hours that had events).  Missing cells get 0.
+    days_df = spark.createDataFrame(
+        [(d,) for d in ["1-Mon", "2-Tue", "3-Wed", "4-Thu", "5-Fri", "6-Sat", "7-Sun"]],
+        ["day_name"],
+    )
+    hours_df = spark.createDataFrame(
+        [(f"{h:02d}",) for h in range(24)],
+        ["hour_of_day"],
+    )
+    facilities_df = gate.select("facility").distinct()
+    dense_grid = facilities_df.crossJoin(days_df).crossJoin(hours_df)
+
+    # Each weekday appears approximately (lookback_days / 7) times in the window;
+    # avg_activity = mean events per occurrence of that weekday-hour slot.
+    occurrences_per_weekday = max(1.0, lookback_days / 7.0)
+
+    heatmap = (
+        dense_grid
+        .join(heatmap_raw, ["facility", "day_name", "hour_of_day"], "left")
+        .fillna(0, subset=["total_activity"])
+        .withColumn("avg_activity", col("total_activity") / lit(occurrences_per_weekday))
+        .withColumn("kpi_type", lit("PEAK_HEATMAP"))
+        .withColumn("computed_at", current_timestamp())   # audit: when this computation ran
+        .withColumn("data_as_of", dataset_now_ts)         # business: max event_time in Silver
+    )
+
     delta_path = "s3a://lakehouse/gold/gold_kpi_peak_hours"
     heatmap.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(delta_path)
     logger.info(f"✅ Computed peak hours: {heatmap.count()} records (overwrite)")
-    register_table_to_metastore(spark, "gold_kpi_peak_hours", delta_path)
+
+
+# -----------------------
+# Inspection Damage Summary
+# -----------------------
+def compute_inspection_summary(spark: SparkSession, lookback_days: int = 90, dataset_now: datetime = None) -> None:
+    """
+    Inspection damage summary aggregated over
+    facility × operational_date × damage_severity × damage_code × damage_component.
+
+    Enables:
+      - Damage severity distribution bar (MINOR / MAJOR / CRITICAL / NO_DEFECT)
+      - Damage code × component hotspot heatmap
+      - Inspection cost analytics (avg_cost_usd per damage type)
+
+    dataset_now anchors the lookback window — never wall clock.
+    """
+    if dataset_now is None:
+        dataset_now = get_dataset_now(spark)
+
+    dataset_now_ts    = lit(dataset_now).cast("timestamp")
+    lookback_start_ts = lit(dataset_now - timedelta(days=lookback_days)).cast("timestamp")
+    logger.info(f"Computing inspection summary (lookback: {lookback_days}d, dataset_now: {dataset_now})")
+
+    # VND → USD approximate conversion for cost normalization.
+    # This is a rough constant used for relative comparison only, not accounting.
+    VND_TO_USD = lit(23000.0)
+
+    events = (
+        spark.read.format("delta")
+        .load("s3a://lakehouse/silver/silver_container_events")
+        .where(col("event_source") == "INSPECTION")
+        .where(col("event_time") >= lookback_start_ts)
+        .where(col("event_time") <= dataset_now_ts)
+        .where(col("facility").isNotNull())
+        # Exclude records where the inspector left severity blank — they carry
+        # no actionable damage classification and would form a spurious '' bucket.
+        .where(col("damage_severity").isNotNull() & (trim(col("damage_severity")) != ""))
+        .select(
+            "facility", "event_time",
+            "damage_severity", "damage_code", "damage_component",
+            "estimated_cost", "currency",
+        )
+        .withColumn(
+            "cost_usd",
+            when(col("currency") == "USD", col("estimated_cost").cast("double"))
+            .when(
+                col("currency") == "VND",
+                col("estimated_cost").cast("double") / VND_TO_USD,
+            )
+            .otherwise(lit(None).cast("double")),
+        )
+        # Normalise sentinel strings ('nan', 'null', …) → NULL so they don't
+        # appear as spurious dimension keys in the groupBy below.
+        .withColumn("damage_code",
+            when(upper(trim(col("damage_code"))).isin("NAN", "NULL", "NONE", "N/A", "UNKNOWN", ""), lit(None))
+            .otherwise(col("damage_code")))
+        .withColumn("damage_component",
+            when(upper(trim(col("damage_component"))).isin("NAN", "NULL", "NONE", "N/A", "UNKNOWN", ""), lit(None))
+            .otherwise(col("damage_component")))
+        # Cap sentinel cost values to avoid skewing averages.
+        # Legitimate container repair costs are typically <$1 000 USD.
+        # VND sentinel 999 999 999 / 23 000 ≈ 43 478 USD; USD sentinel = 999 999 999 USD.
+        # Threshold of 5 000 USD safely caps both while preserving real data.
+        .withColumn("cost_usd",
+            when(col("cost_usd") > lit(5000.0), lit(None)).otherwise(col("cost_usd")))
+        .withColumn("operational_date", to_date(col("event_time")))
+    )
+
+    summary = (
+        events.groupBy(
+            "facility", "operational_date",
+            "damage_severity", "damage_code", "damage_component",
+        )
+        .agg(
+            count("*").alias("inspection_count"),
+            _sum("cost_usd").alias("total_cost_usd"),
+            avg("cost_usd").alias("avg_cost_usd"),
+        )
+        .withColumn("computed_at", current_timestamp())
+        .withColumn("data_as_of", dataset_now_ts)
+    )
+
+    delta_path = "s3a://lakehouse/gold/gold_inspection_summary"
+    summary.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(delta_path)
+    logger.info(f"✅ Computed inspection summary: {summary.count()} records (overwrite)")
+
+
+# -----------------------
+# Yard Move Efficiency Summary
+# -----------------------
+def compute_yard_move_summary(spark: SparkSession, lookback_days: int = 60, dataset_now: datetime = None) -> None:
+    """
+    Yard move efficiency summary aggregated over
+    facility × operational_date × shift_id × move_reason.
+
+    Key metric: REHANDLE rate = REHANDLE moves / total_moves per facility per day.
+    A high REHANDLE rate indicates yard congestion and poor slot planning.
+
+    dataset_now anchors the lookback window — never wall clock.
+    """
+    if dataset_now is None:
+        dataset_now = get_dataset_now(spark)
+
+    dataset_now_ts    = lit(dataset_now).cast("timestamp")
+    lookback_start_ts = lit(dataset_now - timedelta(days=lookback_days)).cast("timestamp")
+    logger.info(f"Computing yard move summary (lookback: {lookback_days}d, dataset_now: {dataset_now})")
+
+    events = (
+        spark.read.format("delta")
+        .load("s3a://lakehouse/silver/silver_container_events")
+        .where(col("event_source") == "YARD")
+        .where(col("event_time") >= lookback_start_ts)
+        .where(col("event_time") <= dataset_now_ts)
+        .where(col("facility").isNotNull())
+        .select("facility", "event_time", "container_id", "move_reason")
+    )
+
+    events_with_shift = add_shift_columns(events, "event_time")
+
+    summary = (
+        events_with_shift.groupBy(
+            "facility", "operational_date", "shift_id", "move_reason",
+        )
+        .agg(
+            count("*").alias("move_count"),
+            countDistinct("container_id").alias("container_count"),
+        )
+        .withColumn("computed_at", current_timestamp())
+        .withColumn("data_as_of", dataset_now_ts)
+    )
+
+    delta_path = "s3a://lakehouse/gold/gold_yard_move_summary"
+    summary.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(delta_path)
+    logger.info(f"✅ Computed yard move summary: {summary.count()} records (overwrite)")
 
 
 def main() -> None:
@@ -415,11 +612,45 @@ def main() -> None:
         logger.info("Starting KPI Batch Aggregation")
         logger.info("=" * 60)
 
-        # 1. Shift KPIs (Detailed productivity)
-        compute_shift_kpis(spark, lookback_days=int(os.environ.get("KPI_SHIFT_LOOKBACK_DAYS", "30")))
-        
-        # 3. NEW: Peak Hour Analytics (Heatmap)
-        compute_peak_hour_analytics(spark, lookback_days=60)
+        # Derive dataset_now ONCE from Silver data and pass to every KPI function.
+        # All rolling windows, date filters, and open-inventory bounds are
+        # anchored to this single value — never to wall-clock time.
+        # This guarantees that re-running the job against the same Silver data
+        # on a different calendar day produces identical Gold output.
+        dataset_now = get_dataset_now(spark)
+        logger.info(f"Analytics reference time: dataset_now = {dataset_now}")
+
+        # 1. Shift KPIs (Detailed shift productivity per facility)
+        compute_shift_kpis(
+            spark,
+            lookback_days=int(os.environ.get("KPI_SHIFT_LOOKBACK_DAYS", "180")),
+            dataset_now=dataset_now,
+        )
+
+        # 2. Daily KPIs with rolling trends (throughput + inventory EOD)
+        compute_daily_kpis(
+            spark,
+            lookback_days=int(os.environ.get("KPI_DAILY_LOOKBACK_DAYS", "365")),
+            dataset_now=dataset_now,
+        )
+
+        # 3. Peak Hour Analytics (Heatmap by day-of-week x hour)
+        # Use short lookback so avg_activity reflects actual data density.
+        compute_peak_hour_analytics(spark, lookback_days=30, dataset_now=dataset_now)
+
+        # 4. Inspection damage summary (severity + damage-code/component breakdown + cost)
+        compute_inspection_summary(
+            spark,
+            lookback_days=int(os.environ.get("KPI_INSPECTION_LOOKBACK_DAYS", "90")),
+            dataset_now=dataset_now,
+        )
+
+        # 5. Yard move efficiency summary (REHANDLE rate + reason breakdown)
+        compute_yard_move_summary(
+            spark,
+            lookback_days=int(os.environ.get("KPI_YARD_LOOKBACK_DAYS", "60")),
+            dataset_now=dataset_now,
+        )
 
         logger.info("=" * 60)
         logger.info("KPI batch job completed successfully")

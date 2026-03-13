@@ -147,8 +147,8 @@ services:
     command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
     environment:
       - SPARK_NO_DAEMONIZE=true
-      - SPARK_WORKER_MEMORY=6G  # Increased from 4G
-      - SPARK_WORKER_CORES=4
+      - SPARK_WORKER_MEMORY=9G  # 3G(Bronze) + 1.5G(Canonical) + 2.5G(Gold) + 1.5G(KPI) = 8.5G max concurrent
+      - SPARK_WORKER_CORES=7   # 2(Bronze) + 1(Canonical) + 2(Gold) + 1(KPI) + 1(buffer) = 7
     volumes:
       - ./spark/jobs:/opt/spark-jobs
       - ./spark/jars:/opt/spark-jars
@@ -208,14 +208,17 @@ services:
       - ./spark/jars:/opt/spark-jars
       - ./spark/conf:/opt/spark/conf
       - spark-data:/opt/spark-data
+    # Resource budget: 3 executor-cores + 4G RAM on the worker
+    # Combine Bronze/Silver/Canonical processing.
     command: >
       spark-submit
       --master spark://spark-master:7077
       --deploy-mode client
-      --total-executor-cores 2
-      --executor-memory 3G
-      --executor-cores 2
-      --driver-memory 2G
+      --total-executor-cores 3
+      --executor-memory 4G
+      --executor-cores 3
+      --driver-memory 1G
+      --conf spark.sql.shuffle.partitions=4
       --conf spark.network.timeout=600s
       --conf spark.executor.heartbeatInterval=30s
       --conf spark.executor.memoryFraction=0.8
@@ -260,14 +263,18 @@ services:
       - ./spark/jars:/opt/spark-jars
       - ./spark/conf:/opt/spark/conf
       - spark-data:/opt/spark-data
+    # Resource budget: 2 executor-cores + 2.5G RAM.
+    # Bronze-Silver (2 cores) + Gold (2 cores) = 4/6 cores.
+    # KPI Batch dùng 1 core còn lại khi scheduled.
     command: >
       spark-submit
       --master spark://spark-master:7077
       --deploy-mode client
       --total-executor-cores 2
-      --executor-memory 3G
+      --executor-memory 2500M
       --executor-cores 2
-      --driver-memory 2G
+      --driver-memory 1G
+      --conf spark.sql.shuffle.partitions=4
       --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
       --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
       --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
@@ -323,9 +330,11 @@ services:
           spark-submit \
             --master spark://spark-master:7077 \
             --deploy-mode client \
-            --total-executor-cores 2 \
-            --conf spark.executor.memory=1g \
-            --conf spark.driver.memory=1g \
+            --total-executor-cores 1 \
+            --executor-cores 1 \
+            --conf spark.executor.memory=1500m \
+            --conf spark.driver.memory=512m \
+            --conf spark.sql.shuffle.partitions=4 \
             --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
             --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
             --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
@@ -590,7 +599,42 @@ services:
     volumes:
       - ./data:/app/data
       - ./producer:/app
-    command: python producer.py --mode loop --interval 30 --limit 300
+      - producer-sim-state:/app/state   # persists simulation clock across restarts
+    # Simulation mode: replay historical data day-by-day through Kafka.
+    #
+    # Tuning guide:
+    #   --inter-event-delay 0.02   → 20ms/event = ~29 phút publish  ← CONCURRENT (mặc định)
+    #   --inter-event-delay 0.01   → 10ms/event = ~15 phút publish  ← concurrent nếu RAM > 8G
+    #   --inter-event-delay 0.001  → 1ms/event  = ~90s publish      ← SEQUENTIAL only
+    #   --inter-event-delay 0      → max speed  = ~30s              ← SEQUENTIAL only
+    #   --interval 20              → 20s giữa các sim-day           ← CONCURRENT (mặc định)
+    #   --interval 10              → 10s giữa sim-day               ← concurrent RAM > 8G
+    #   --interval 0               → không ngủ giữa các day         ← SEQUENTIAL only
+    #   --sim-advance-days 1       → 1 ngày/tick (chi tiết nhất)
+    #
+    # Tại sao cần chậm khi concurrent?
+    #   Tốc độ 0.001s/event → 1000 events/s → Spark batch ~10,000 events/10s
+    #   Bronze + Silver + Gold cùng xử lý batch lớn → OOM executor
+    #   Tốc độ 0.02s/event  → 50 events/s  → Spark batch ~500 events/10s
+    #   Mỗi job chỉ xử lý batch nhỏ → tổng RAM thấp, không bị kill
+    #
+    # Sequential (RAM-saving) workflow — run services one at a time:
+    #   Step 1: Start only Kafka + producer-stream (đổi delay=0.001, interval=0)
+    #           → wait ~90s for all data to publish
+    #   Step 2: Stop producer-stream, start spark-stream-bronze-silver → wait 2-3 min
+    #   Step 3: Start spark-stream-gold-ops → wait 1-2 min
+    #   Step 4: Run spark-kpi-batch once
+    #
+    # Concurrent workflow (mặc định dưới):
+    #   --interval 20 --inter-event-delay 0.02  → ~29 phút publish
+    #   Spark có 20s giữa mỗi batch day để xử lý trước khi batch tiếp đến
+    command: >
+      python producer.py
+        --mode loop
+        --interval 10
+        --sim-advance-days 1
+        --inter-event-delay 0.01
+        --sim-data-start 2025-12-01
     restart: unless-stopped
     networks:
       - lakehouse
@@ -602,6 +646,7 @@ volumes:
   metastore-db-data:
   spark-data:
   superset-data:
+  producer-sim-state:   # simulation clock state (sim_clock.json)
 
 networks:
   lakehouse:
