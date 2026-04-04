@@ -7,7 +7,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, from_json, current_timestamp, lit, upper, trim,
     regexp_replace, regexp_extract, length, coalesce, to_timestamp, concat_ws, md5,
-    when, expr, year, to_date
+    when, year, to_date
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType,
@@ -27,8 +27,6 @@ GATE_SCHEMA = StructType([
     StructField("event_id", StringType(), True),
     StructField("event_type", StringType(), True),
     StructField("event_time", StringType(), True),
-    StructField("date_raw", StringType(), True),
-    StructField("time_raw", StringType(), True),
     StructField("container_no_raw", StringType(), True),
     StructField("eir", StringType(), True),
     StructField("seq", StringType(), True),
@@ -47,9 +45,7 @@ GATE_SCHEMA = StructType([
     StructField("nominate_remark", StringType(), True),
     StructField("facility", StringType(), True),
     StructField("source_file", StringType(), True),
-    StructField("source_sheet", StringType(), True),
     StructField("source_row", StringType(), True),
-    StructField("is_synthetic", StringType(), True),
     StructField("ingest_time", StringType(), True)
 ])
 
@@ -101,16 +97,14 @@ CLEANING_SCHEMA = StructType([
     StructField("event_id", StringType(), True),
     StructField("event_type", StringType(), True),
     StructField("event_time", StringType(), True),
-    StructField("date_in", StringType(), True),
     StructField("container_no_raw", StringType(), True),
     StructField("type_raw", StringType(), True),
     StructField("remark_raw", StringType(), True),
     StructField("amount", StringType(), True),
+    StructField("currency", StringType(), True),
     StructField("facility", StringType(), True),
     StructField("source_file", StringType(), True),
-    StructField("source_sheet", StringType(), True),
     StructField("source_row", StringType(), True),
-    StructField("is_synthetic", StringType(), True),
     StructField("ingest_time", StringType(), True)
 ])
 
@@ -121,17 +115,11 @@ MNR_SCHEMA = StructType([
     StructField("container_no_raw", StringType(), True),
     StructField("size_raw", StringType(), True),
     StructField("location_raw", StringType(), True),
-    StructField("amount_raw", StringType(), True),
-    StructField("cleaning_cost_raw", StringType(), True),
-    StructField("repair_cost_raw", StringType(), True),
-    StructField("discount_raw", StringType(), True),
     StructField("note_raw", StringType(), True),
     StructField("stage", StringType(), True),
     StructField("facility", StringType(), True),
     StructField("source_file", StringType(), True),
-    StructField("source_sheet", StringType(), True),
     StructField("source_row", StringType(), True),
-    StructField("is_synthetic", StringType(), True),
     StructField("ingest_time", StringType(), True)
 ])
 
@@ -211,10 +199,8 @@ def stream_kafka_to_bronze(spark, topic, schema, table_name):
         .format("kafka")
         .option("kafka.bootstrap.servers", "kafka:9092")
         .option("subscribe", topic)
-        .option("startingOffsets", "earliest")  # Read all existing data
-        .option("maxOffsetsPerTrigger", "5000")  # 5k msg/trigger × 10s interval
-        # = ~500 msg/s throughput per topic; full 87k dataset consumed in ~17 triggers (~3 min)
-        # Lower if OOM: 2000-3000. Raise for faster catch-up on fast-producer runs.
+        .option("startingOffsets", "earliest")  #
+        .option("maxOffsetsPerTrigger", "5000")  
         .option("failOnDataLoss", "false")  # Handle topic deletion gracefully
         .load())
     
@@ -259,7 +245,7 @@ def stream_kafka_to_bronze(spark, topic, schema, table_name):
         count = batch_df.count()
         if count > 0:
             logger.info(f"Bronze {table_name} - Batch: {batch_id} - Processing {count} records")
-        batch_df.write.format("delta").mode("append").option("mergeSchema", "true").save(bronze_path)
+        batch_df.write.format("delta").mode("append").save(bronze_path)
     
     # Write valid records to Bronze
     bronze_path = f"s3a://lakehouse/bronze/bronze_{table_name}"
@@ -280,7 +266,6 @@ def stream_kafka_to_bronze(spark, topic, schema, table_name):
         .format("delta")
         .outputMode("append")
         .option("checkpointLocation", dlq_checkpoint)
-        .option("mergeSchema", "true")
         .trigger(processingTime="10 seconds")
         .start(dlq_path))
     
@@ -289,13 +274,7 @@ def stream_kafka_to_bronze(spark, topic, schema, table_name):
 
 # ==================== SILVER LAYER ====================
 
-# ===== DATA QUALITY CONSTANTS =====
-# Gate event types: validated via validate_event_type() in stream_bronze_to_silver_gate.
-# Other sources (yard, cleaning, MNR, inspection) do not whitelist at the source-Silver
-# level because the canonical projectors in stream_silver_to_canonical enforce the
-# canonical event_type taxonomy unconditionally — source Silver event_type is mapped
-# to a canonical value (YARD_MOVE, CLEANING_COMPLETED, MNR_STARTED/APPROVED/COMPLETED,
-# INSPECTION_COMPLETED, DAMAGE_REPORTED) regardless of its raw content.
+
 VALID_EVENT_TYPES_GATE = ["GATE_IN", "GATE_OUT"]
 
 MIN_VALID_YEAR = 2020
@@ -304,12 +283,6 @@ MAX_VALID_YEAR = 2030
 
 def normalize_container_number(col_name):
     """
-    Normalize container number with strict cleansing:
-    1. Trim whitespace
-    2. Convert to uppercase
-    3. Remove special characters, keep only alphanumeric
-    4. Return None if empty after cleaning
-    
     Examples:
     - '  TCNU1234567  ' -> 'TCNU1234567'
     - 'tcnu9876543' -> 'TCNU9876543'
@@ -317,7 +290,6 @@ def normalize_container_number(col_name):
     """
     normalized = upper(trim(regexp_replace(col(col_name), r"[^A-Za-z0-9]", "")))
     
-    # If empty string after cleaning, convert to None
     return when(normalized == "", lit(None)).otherwise(normalized)
 
 
@@ -334,61 +306,32 @@ def normalize_facility(*col_names):
     return coalesce(*candidates)
 
 
-def parse_event_timestamp(time_col, date_col=None, time_raw_col=None):
+def normalize_gate_location(location_col, position_col):
     """
-    Parse event timestamp with STRICT validation:
-    1. Try multiple formats for primary time_col
-    2. Fallback to combined date_raw + time_raw if available
-    3. REJECT future dates (> 2030) and very old dates (< 2020)
-    4. Return None for ANY invalid timestamp (no silent defaults)
-    
-    Valid date range: 2020-01-01 to 2030-12-31
-    
-    Returns:
-    - Valid timestamp: Parsed and validated timestamp
-    - Invalid: None (will be filtered out by HARD FILTER)
+    Keep corrected source location as primary.
+    Fallback: if location is empty, derive generalized area from position.
     """
-    
-    # Parse primary timestamp column.
-    # to_timestamp(col) WITHOUT explicit format is tried FIRST: it uses Spark's
-    # built-in ICU/Java DateTimeFormatter which handles any ISO-8601 variant,
-    # including nanosecond precision ("yyyy-MM-dd HH:mm:ss.SSSSSSSSS") and UTC
-    # offset ("+00:00").  Explicit formats are kept as safety nets for legacy
-    # date-only strings (e.g. "dd/MM/yyyy") that the auto-parser may misinterpret.
-    parsed_primary = coalesce(
-        to_timestamp(col(time_col)),                                   # auto: handles ns, tz, all ISO variants
+    loc = trim(col(location_col).cast("string"))
+    pos = trim(col(position_col).cast("string"))
+
+    loc_non_empty = when(length(loc) > 0, loc).otherwise(lit(None))
+    pos_non_empty = when(length(pos) > 0, pos).otherwise(lit(None))
+    derived_from_position = regexp_replace(pos_non_empty, r"-\d+-\d+$", "")
+
+    return coalesce(loc_non_empty, derived_from_position)
+
+
+def parse_event_timestamp(time_col):
+
+    # Keep a small set of formats that match the current CSV contracts.
+    parsed_time = coalesce(
+        to_timestamp(col(time_col)),
         to_timestamp(col(time_col), "yyyy-MM-dd HH:mm:ss"),
-        to_timestamp(col(time_col), "yyyy-MM-dd HH:mm:ss.SSSSSSSSS"), # nanosecond with space separator
-        to_timestamp(col(time_col), "yyyy-MM-dd HH:mm:ss.SSSSSS"),    # microsecond with space separator
-        to_timestamp(col(time_col), "dd/MM/yyyy HH:mm:ss"),
         to_timestamp(col(time_col), "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"),
-        to_timestamp(col(time_col), "yyyy-MM-dd'T'HH:mm:ss.SSS"),
         to_timestamp(col(time_col), "yyyy-MM-dd'T'HH:mm:ss"),
-        to_timestamp(col(time_col), "dd/MM/yyyy HH:mm"),
-        to_timestamp(col(time_col), "yyyy-MM-dd"),
-        to_timestamp(col(time_col), "dd/MM/yyyy")
+        to_timestamp(col(time_col), "yyyy-MM-dd")
     )
-    
-    # Fallback to combined date + time if primary failed and columns exist
-    parsed_combined = None
-    if date_col and time_raw_col:
-        parsed_combined = coalesce(
-            # ISO format (yyyy-MM-dd) — matches stg_gate_events.csv date_raw / time_raw columns
-            to_timestamp(concat_ws(" ", col(date_col), col(time_raw_col)), "yyyy-MM-dd HH:mm:ss"),
-            to_timestamp(concat_ws(" ", col(date_col), col(time_raw_col)), "yyyy-MM-dd HH:mm"),
-            to_timestamp(col(date_col), "yyyy-MM-dd"),
-            # dd/MM/yyyy variant kept for backward compatibility with legacy exports
-            to_timestamp(concat_ws(" ", col(date_col), col(time_raw_col)), "dd/MM/yyyy HH:mm:ss"),
-            to_timestamp(concat_ws(" ", col(date_col), col(time_raw_col)), "dd/MM/yyyy HH:mm"),
-            to_timestamp(col(date_col), "dd/MM/yyyy"),
-        )
-    
-    # Use primary, then combined fallback
-    if parsed_combined is not None:
-        parsed_time = coalesce(parsed_primary, parsed_combined)
-    else:
-        parsed_time = parsed_primary
-    
+
     # Validate: Only accept dates within 2020-2030 range
     validated = when(
         (year(parsed_time) >= lit(MIN_VALID_YEAR)) & (year(parsed_time) <= lit(MAX_VALID_YEAR)),
@@ -398,28 +341,19 @@ def parse_event_timestamp(time_col, date_col=None, time_raw_col=None):
     return validated
 
 
+
+
 def validate_event_type(col_name, valid_types_list):
-    """
-    Validate event_type against whitelist of allowed values
-    
-    Steps:
-    1. Normalize: trim, uppercase, remove non-alphanumeric + underscores
-    2. Replace common separators (dash, space) with underscore
-    3. Check against whitelist
-    4. Return normalized value if valid, None if invalid
-    """
-    # Normalize the input column
+
     normalized = upper(
         trim(
             regexp_replace(
                 regexp_replace(col(col_name), r"[\s\-]+", "_"),  # Replace space/dash with _
-                r"[^A-Za-z0-9_]", ""  # Remove special chars except underscore
+                r"[^A-Za-z0-9_]", ""  
             )
         )
     )
-    
-    # Check if normalized is in the list of valid types using isin() method
-    # If yes, return normalized; if no, return None
+
     return when(
         normalized.isin(valid_types_list),
         normalized
@@ -432,25 +366,7 @@ def generate_event_id(*columns):
 
 
 def stream_bronze_to_silver_gate(spark):
-    """
-    Stream Bronze gate events to Silver with COMPREHENSIVE data cleaning
-    
-    DATA QUALITY PIPELINE:
-    1. CLEANSING LAYER (Fix fixable errors):
-       - Normalize container_no: trim, uppercase, remove special chars
-       - Normalize event_type: trim, uppercase, handle common typos
-    
-    2. HARD FILTER LAYER (Drop invalid records):
-       - Drop if container_no_norm IS NULL or empty
-       - Drop if event_time_parsed IS NULL
-       - Drop if event_time is outside valid range (2020-2030)
-       - Drop if event_type_norm IS NULL (not in whitelist)
-    
-    3. DEDUPLICATION:
-       - Remove exact duplicates based on event_id
-    
-    Records removed at each stage are logged for monitoring.
-    """
+
     logger.info("=" * 70)
     logger.info("Starting Silver normalization: GATE EVENTS")
     logger.info("Quality gates: NULL checks, date validation, event type whitelist")
@@ -462,49 +378,31 @@ def stream_bronze_to_silver_gate(spark):
     
     # ===== STEP 1: CLEANSING (Fix fixable errors) =====
     cleansed_stream = (bronze_stream
-        # Normalize container number (trim, uppercase, remove special chars)
         .withColumn("container_no_norm", normalize_container_number("container_no_raw"))
-        
-        # Normalize facility (CTxx) from facility/location
+        .withColumn("location", normalize_gate_location("location", "position"))
         .withColumn("facility_raw", col("facility"))
-        .withColumn("facility", normalize_facility("facility", "location"))
+        .withColumn("facility", normalize_facility("facility", "location", "position"))
         
-        # Parse and validate timestamp (reject future/past dates)
         .withColumn("event_time_parsed", 
-            parse_event_timestamp("event_time", "date_raw", "time_raw"))
-        
-        # Normalize event type (uppercase, remove dashes/spaces, validate against whitelist)
+            parse_event_timestamp("event_time"))        
         .withColumn("event_type_norm", 
             validate_event_type("event_type", VALID_EVENT_TYPES_GATE))
-        
-        # Add metadata
         .withColumn("silver_ingest_time", current_timestamp())
     )
     
+
     # ===== STEP 2: HARD FILTER (Drop invalid records) =====
     logger.info("Applying hard quality gates...")
     
     filtered_stream = (cleansed_stream
-        # GATE 1: Drop if container_no is null after normalization
         .where(col("container_no_norm").isNotNull())
-        .where(col("container_no_norm") != "")  # Extra check for empty
-        
-        # GATE 2: Drop if event_time is null or outside valid range
+        .where(col("container_no_norm") != "")         
         .where(col("event_time_parsed").isNotNull())
-        
-        # GATE 2b: Drop if facility cannot be derived
         .where(col("facility").isNotNull())
-        
-        # GATE 3: Drop if event_type not in whitelist
         .where(col("event_type_norm").isNotNull())
     )
     
     # ===== STEP 3: Generate event_id =====
-    # Use source_row + source_file (stable CSV identifiers) as the dedup key.
-    # event_time_parsed and kafka offsets must NOT be used: on each producer
-    # replay loop the same source row is re-published, so only the CSV-origin
-    # coordinates are stable across restarts.  Idempotency is enforced by
-    # Delta MERGE ON event_id_generated in the foreachBatch callback below.
     final_stream = (filtered_stream
         .withColumn("event_id_generated",
             generate_event_id("container_no_norm", "event_type_norm",
@@ -564,9 +462,6 @@ def stream_bronze_to_silver_yard_move(spark):
         .withColumn("event_time_parsed", parse_event_timestamp("event_time"))
         .where(col("event_time_parsed").isNotNull())
         .where(col("facility").isNotNull())
-        # source_file + source_row are stable across producer restarts (move_id / CSV index).
-        # kafka_partition / kafka_offset are broker-assigned and change on every replay,
-        # so they must NOT be used as dedup keys.
         .withColumn("event_id_generated",
             generate_event_id("container_no_norm", "source_file", "source_row"))
         .withColumn("silver_ingest_time", current_timestamp())
@@ -616,24 +511,14 @@ def stream_bronze_to_silver_inspection(spark):
         .withColumn("event_time_parsed", parse_event_timestamp("event_time"))
         .where(col("event_time_parsed").isNotNull())
         .where(col("facility").isNotNull())
-        # Normalise severity to a canonical value:
-        #   NULL / empty       → NULL (no data)
-        #   N/A, NONE, NULL    → NULL (unknown)
-        #   NAN                → NO_DEFECT (inspected, no damage found — business domain meaning)
-        #   otherwise          → uppercase trimmed value (MINOR / MAJOR / CRITICAL / …)
         .withColumn("severity_norm",
             when(col("severity").isNull() | (trim(col("severity")) == ""), lit(None))
             .when(upper(trim(col("severity"))).isin("N/A", "NULL", "NONE"), lit(None))
             .when(upper(trim(col("severity"))) == "NAN", lit("NO_DEFECT"))
             .otherwise(upper(trim(col("severity")))))
-        # damage_code + component keeps within-row disambiguation when a single
-        # container has multiple damage findings in the same inspection record.
-        # source_file + source_row provide the stable CSV-origin coordinates.
         .withColumn("event_id_generated",
             generate_event_id("container_no_norm", "source_file", "source_row",
                               "damage_code", "component"))
-        # Normalise sentinel strings ('nan', 'null', …) → NULL AFTER event_id is
-        # computed so existing Silver dedup keys remain stable across restarts.
         .withColumn("damage_code",
             when(upper(trim(col("damage_code"))).isin("NAN", "NULL", "NONE", "N/A"), lit(None))
             .otherwise(col("damage_code")))
@@ -684,19 +569,10 @@ def stream_bronze_to_silver_cleaning(spark):
         .withColumn("container_no_norm", normalize_container_number("container_no_raw"))
         .withColumn("facility_raw", col("facility"))
         .withColumn("facility", normalize_facility('facility'))
-        # Parse event_time and date_in SEPARATELY before merging.
-        # Raw coalesce would pick a bogus date string (e.g. "2016-01-29") over a valid date_in
-        # because the string is non-null. By validating first, the out-of-range value becomes
-        # NULL and date_in is used as the correct fallback.
-        .withColumn("_et_primary", parse_event_timestamp("event_time"))
-        .withColumn("_et_fallback", parse_event_timestamp("date_in"))
-        .withColumn("event_time_parsed", coalesce(col("_et_primary"), col("_et_fallback")))
-        .drop("_et_primary", "_et_fallback")
+        .withColumn("event_time_parsed", parse_event_timestamp("event_time"))
         .where(col("event_time_parsed").isNotNull())
         .where(col("facility").isNotNull())
         .withColumn("event_type_norm",
-            # Normalise sentinel strings (N/A, nan, NULL, …) → NULL before writing to Silver
-            # so cleaning_type in canonical never carries placeholder junk values.
             when(upper(trim(col("event_type"))).isin("N/A", "NAN", "NULL", "NONE", ""), lit(None))
             .otherwise(upper(trim(col("event_type")))))
         .withColumn("event_id_generated",
@@ -749,24 +625,14 @@ def stream_bronze_to_silver_mnr(spark):
         .withColumn("event_time_parsed", parse_event_timestamp("event_time"))
         .where(col("event_time_parsed").isNotNull())
         .where(col("facility").isNotNull())
-        .withColumn("event_type_norm", upper(trim(col("event_type"))))
-        # Normalise UNKNOWN_STAGE_XX values to NULL — these are placeholder strings written
-        # by the producer when a stage cannot be determined from the source data.
-        # Also normalise variant stage spellings to their canonical forms so the
-        # _project_mnr_to_canonical conditions (stage_norm == "APPROVED" / "REPAIRED") match:
-        #   APPROVAL  → APPROVED  (data uses APPROVAL; canonical expects APPROVED)
-        #   COMPLETED → REPAIRED  (data uses COMPLETED as synonym for REPAIRED lifecycle stage)
         .withColumn("stage_norm",
             when(upper(trim(col("stage"))).rlike("(?i)^UNKNOWN_STAGE"), lit(None))
-            .when(upper(trim(col("stage"))) == "APPROVAL",  lit("APPROVED"))  # normalize to canonical
-            .when(upper(trim(col("stage"))) == "COMPLETED", lit("REPAIRED"))  # normalize completion variant
+            .when(upper(trim(col("stage"))) == "APPROVAL",  lit("APPROVED")) 
+            .when(upper(trim(col("stage"))) == "COMPLETED", lit("REPAIRED"))  
             .otherwise(upper(trim(col("stage")))))
-        # event_type_norm + stage_norm disambiguate MNR lifecycle stages
-        # (RECEIVED → APPROVED → REPAIRED) that may share the same source_row
-        # in aggregated MNR files where one row tracks the full MNR workflow.
         .withColumn("event_id_generated",
-            generate_event_id("container_no_norm", "event_type_norm",
-                              "stage_norm", "source_file", "source_row"))
+            generate_event_id("container_no_norm", "stage_norm",
+                              "source_file", "source_row"))
         .withColumn("silver_ingest_time", current_timestamp())
     )
 
@@ -800,42 +666,9 @@ def stream_bronze_to_silver_mnr(spark):
 
 
 # ==================== CANONICAL SILVER LAYER ====================
-#
-# silver_container_events unifies all 5 source-specific Silver tables into one
-# deterministic, Gold-consumable event model.
-#
-# Design rules enforced here:
-#   1. event_id        = event_id_generated from each source Silver table (stable MD5,
-#                        already used for that table's own dedup).
-#   2. event_type      = canonical taxonomy value — NOT the raw source string.
-#   3. facility        = CTxx — trusted from Silver, never re-normalized here.
-#   4. One row per canonical event.  A single source row may produce one or more
-#      canonical rows only when the source schema encodes multiple discriminated
-#      lifecycle stages in one CSV row (MNR only).
-#   5. Gold MUST read from silver_container_events, not from the 5 source tables.
-#      (Gold refactor is Step 5.)
-#
-# Event types NOT derivable from current sources:
-#   INSPECTION_STARTED  — inspection_damage_report.csv records only the completion time.
-#   CLEANING_STARTED    — stg_cleaning_events.csv has no explicit start marker;
-#                         `date_in` is a timestamp fallback, not a STARTED event.
-#   VESSEL_ARRIVED      — booking_vessel_schedule.csv has planned ETA only;
-#                         no actual-arrival event flows through Kafka.
-#   VESSEL_DEPARTED     — same as above for ETD.
-#   VESSEL_ASSIGNED     — GATE_IN rows carry booking_no + vessel + voyage when a
-#                         container is linked to a vessel; Gold (Step 5) reads
-#                         GATE_IN WHERE vessel IS NOT NULL for this context.
-#
-# MNR_APPROVED note:
-#   The requested taxonomy specifies only MNR_STARTED and MNR_COMPLETED.
-#   The MNR source has three lifecycle stages: RECEIVED → APPROVED → REPAIRED.
-#   MNR_APPROVED is preserved as a distinct event_type because collapsing it into
-#   MNR_STARTED would make RECEIVED→APPROVED dwell calculations impossible.
-#   Either add MNR_APPROVED to the official taxonomy, or re-map to MNR_STARTED
-#   if a binary STARTED/COMPLETED distinction is sufficient.
+
 
 CANONICAL_SILVER_SCHEMA = StructType([
-    # ── Immutable identity ────────────────────────────────────────────────────
     StructField("event_id",              StringType(),    True),  # event_id_generated from source Silver
     StructField("container_id",          StringType(),    True),  # container_no_norm
     # ── Canonical lifecycle ───────────────────────────────────────────────────
@@ -860,10 +693,6 @@ CANONICAL_SILVER_SCHEMA = StructType([
     StructField("move_reason",           StringType(),    True),
     # ── Inspection / damage context (INSPECTION source only) ─────────────────
     StructField("inspection_id",         StringType(),    True),  # original source inspection_id
-    #   NOTE: inspection_id is stored in the Bronze `event_id` field because the
-    #   INSPECTION_SCHEMA maps the source CSV `inspection_id` column to `event_id`.
-    #   One inspection_id may yield multiple canonical rows — one per damage finding
-    #   (damage_code + component distinguish them inside event_id_generated).
     StructField("damage_code",           StringType(),    True),
     StructField("damage_component",      StringType(),    True),
     StructField("damage_severity",       StringType(),    True),  # severity_norm: MINOR/MAJOR/CRITICAL
@@ -882,29 +711,10 @@ CANONICAL_SILVER_SCHEMA = StructType([
     StructField("canonical_ingest_time", TimestampType(), True),  # when row entered canonical table
 ])
 
-# ---------------------------------------------------------------------------
-# Source-to-canonical projection helpers
-# Each function takes a DataFrame (stream or batch) and returns a DataFrame
-# with exactly the 32 CANONICAL_SILVER_SCHEMA columns.
-# Null sentinels use lit(None).cast("<type>") to guarantee schema alignment
-# when the column is not relevant for that event source.
-# ---------------------------------------------------------------------------
+
 
 def _project_gate_to_canonical(df):
-    """
-    silver_gate_events → canonical
 
-    Canonical event_type mapping:
-      GATE_IN  → GATE_IN
-      GATE_OUT → GATE_OUT
-
-    VESSEL_ASSIGNED context: GATE_IN rows where vessel IS NOT NULL carry
-    booking_no + vessel + voyage.  Gold (Step 5) reads these rows directly;
-    no synthetic VESSEL_ASSIGNED event is emitted here.
-
-    Not derivable: VESSEL_ARRIVED, VESSEL_DEPARTED (no vessel lifecycle events
-    in gate source; booking_vessel_schedule.csv has planned ETD/ETA only).
-    """
     return df.select(
         col("event_id_generated").alias("event_id"),
         col("container_no_norm").alias("container_id"),
@@ -921,7 +731,10 @@ def _project_gate_to_canonical(df):
         col("voyage"),
         col("eir").alias("eir_ref"),
         col("truck"),                               # gate-only: transport truck ID
-        col("location").alias("from_location"),     # slot / approach position at gate
+        coalesce(
+            when(length(trim(col("position"))) > 0, trim(col("position"))),
+            col("location")
+        ).alias("from_location"),                  # prefer detailed slot reference
         lit(None).cast("string").alias("to_location"),
         lit(None).cast("string").alias("move_reason"),
         lit(None).cast("string").alias("inspection_id"),
@@ -942,23 +755,7 @@ def _project_gate_to_canonical(df):
 
 
 def _project_yard_to_canonical(df):
-    """
-    silver_yard_moves → canonical
 
-    All source event types (YARD_MOVE, YARD_TRANSFER, RESTACK, LOAD, UNLOAD)
-    → YARD_MOVE.
-
-    LOAD / UNLOAD limitation: these likely represent container transfers
-    to/from vessels, but vessel context (vessel name, voyage) is absent from
-    the yard schema (yard_location_movement.csv has no vessel column).
-    Until booking-context enrichment in Step 5, LOAD and UNLOAD are treated as
-    YARD_MOVE.  Gold MUST NOT assume LOAD events represent confirmed vessel
-    boardings without joining to booking context.
-
-    from_location / to_location: built from individual block/row/bay/tier
-    columns via coalesce with the composite from_location / to_location fields
-    (which the producer may or may not populate).
-    """
     from_loc = coalesce(
         col("from_location"),
         concat_ws("-", col("from_block"), col("from_row"), col("from_bay"), col("from_tier")),
@@ -967,8 +764,6 @@ def _project_yard_to_canonical(df):
         col("to_location"),
         concat_ws("-", col("to_block"), col("to_row"), col("to_bay"), col("to_tier")),
     )
-    # Strip leading 'nan-' segments produced by pandas NaN block names (e.g. "nan-nan-nan-5").
-    # These are data-quality artefacts from the producer; normalise to NULL at Silver boundary.
     to_loc = when(to_loc.rlike("(?i)^nan[-]"), lit(None)).otherwise(to_loc)
     from_loc = when(from_loc.rlike("(?i)^nan[-]"), lit(None)).otherwise(from_loc)
     return df.select(
@@ -1008,28 +803,7 @@ def _project_yard_to_canonical(df):
 
 
 def _project_inspection_to_canonical(df):
-    """
-    silver_inspections → canonical
 
-    Canonical event_type mapping:
-      INSPECTION    → INSPECTION_COMPLETED
-      DAMAGE_REPORT → DAMAGE_REPORTED
-
-    Not derivable: INSPECTION_STARTED
-      inspection_damage_report.csv records a single timestamp (inspection_time),
-      which is the completion time.  No start timestamp exists in the source.
-
-    inspection_id provenance:
-      The Bronze INSPECTION_SCHEMA maps the source CSV `inspection_id` column to
-      the Bronze `event_id` field.  Therefore, col("event_id") in silver_inspections
-      holds the original source inspection identifier (e.g. "INSP7922334").
-
-    One-to-many note:
-      A single inspection_id may produce multiple canonical rows — one per damage
-      finding (damage_code + component are included in event_id_generated).
-      Gold joins involving inspection_id have 1:N cardinality from inspection to
-      damage findings and MUST handle this in aggregation, not in direct joins.
-    """
     canonical_type = (
         when(upper(trim(col("event_type"))) == "DAMAGE_REPORT", lit("DAMAGE_REPORTED"))
         .otherwise(lit("INSPECTION_COMPLETED"))
@@ -1071,21 +845,7 @@ def _project_inspection_to_canonical(df):
 
 
 def _project_cleaning_to_canonical(df):
-    """
-    silver_cleaning_events → canonical
 
-    All cleaning event types (CLEANING, CLEAN, WASHING) → CLEANING_COMPLETED.
-    The original event_type_norm is preserved in cleaning_type for downstream
-    differentiation.
-
-    Not derivable: CLEANING_STARTED
-      stg_cleaning_events.csv has a `Date In` / `date_in` field, but this column
-      is used as a timestamp fallback (not as a distinct started event), and its
-      semantic meaning ("date the container checked in") differs from a cleaning
-      start time.  Treat it as intake context, not a CLEANING_STARTED lifecycle
-      event.  If a CLEANING_STARTED event is required, the upstream system must
-      publish it explicitly.
-    """
     return df.select(
         col("event_id_generated").alias("event_id"),
         col("container_no_norm").alias("container_id"),
@@ -1110,7 +870,7 @@ def _project_cleaning_to_canonical(df):
         lit(None).cast("string").alias("damage_component"),
         lit(None).cast("string").alias("damage_severity"),
         lit(None).cast("double").alias("estimated_cost"),
-        lit(None).cast("string").alias("currency"),
+        coalesce(col("currency"), lit("USD")).alias("currency"),
         col("event_type_norm").alias("cleaning_type"),   # CLEANING / CLEAN / WASHING
         col("remark_raw").alias("cleaning_remark"),
         col("amount").cast("double").alias("cleaning_amount"),
@@ -1123,49 +883,11 @@ def _project_cleaning_to_canonical(df):
 
 
 def _project_mnr_to_canonical(df):
-    """
-    silver_mnr_events → canonical
 
-    Canonical event_type mapping (stage_norm has priority over event_type_norm
-    because stage_norm is the explicit MNR lifecycle discriminator):
-
-      stage_norm = REPAIRED  OR  event_type_norm IN (MNR_REPAIRED, MNR_COMPLETE)
-          → MNR_COMPLETED
-      stage_norm = APPROVED  OR  event_type_norm IN (MNR_APPROVED, MNR_APPROVAL)
-          → MNR_APPROVED    ← intermediate stage; see design note below
-      all other combinations (RECEIVED, MNR, REPAIR, MAINTENANCE, MNR_RECEIVED,
-          MNR_ESTIMATE, unrecognized)
-          → MNR_STARTED
-
-    MNR_APPROVED design note:
-      The requested taxonomy lists only MNR_STARTED and MNR_COMPLETED.
-      MNR_APPROVED is intentionally preserved as a distinct event_type because:
-        (a) the MNR workflow has three named stages (RECEIVED → APPROVED → REPAIRED),
-        (b) collapsing APPROVED into MNR_STARTED would make the APPROVED→REPAIRED
-            repair-time window incalculable.
-      Resolution options for the business:
-        Option A — add MNR_APPROVED to the official taxonomy (recommended).
-        Option B — re-map MNR_APPROVED to MNR_STARTED if only binary STARTED/COMPLETED
-                   distinction is needed; change lit("MNR_APPROVED") to lit("MNR_STARTED").
-
-    Multi-row note:
-      A single MNR source row (source_file + source_row) that encodes multiple
-      lifecycle stages produces multiple canonical events with different event_id
-      values (because event_id_generated includes stage_norm).  These rows share
-      (container_id, source_file, source_row) — the natural MNR job key.
-    """
-    # stage_norm is the authoritative MNR lifecycle discriminator.
-    # event_type_norm is only used as a fallback when stage_norm is null.
-    # Using OR (old logic) allowed event_type=MNR_REPAIRED to override
-    # stage_norm=ESTIMATE → incorrect MNR_COMPLETED classification.
     canonical_type = (
-        # Stage-norm branch: authoritative when stage is populated
         when(col("stage_norm") == "REPAIRED",  lit("MNR_COMPLETED"))
         .when(col("stage_norm") == "APPROVED",  lit("MNR_APPROVED"))
-        .when(col("stage_norm").isNotNull(),     lit("MNR_STARTED"))
-        # event_type_norm fallback: only reached when stage_norm is null
-        .when(col("event_type_norm").isin("MNR_REPAIRED", "MNR_COMPLETE"), lit("MNR_COMPLETED"))
-        .when(col("event_type_norm").isin("MNR_APPROVED", "MNR_APPROVAL"), lit("MNR_APPROVED"))
+        .when(col("stage_norm").isNotNull(),      lit("MNR_STARTED"))
         .otherwise(lit("MNR_STARTED"))
     )
     return df.select(
@@ -1197,20 +919,15 @@ def _project_mnr_to_canonical(df):
         lit(None).cast("string").alias("cleaning_remark"),
         lit(None).cast("double").alias("cleaning_amount"),
         col("stage_norm").alias("mnr_stage"),
-        col("amount_raw").cast("double").alias("mnr_amount"),
-        col("repair_cost_raw").cast("double").alias("repair_cost"),
+        lit(None).cast("double").alias("mnr_amount"),
+        lit(None).cast("double").alias("repair_cost"),
         col("silver_ingest_time"),
         current_timestamp().alias("canonical_ingest_time"),
     )
 
 
 def _wait_for_silver_table(spark, path: str, timeout: int = 600, interval: int = 15) -> None:
-    """Block until the Delta table at `path` exists (has at least one commit).
 
-    Called before opening a readStream on a Silver source table to prevent
-    DELTA_SCHEMA_NOT_SET on fresh deployments where the Bronze→Silver stream
-    hasn't written its first batch yet.
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -1229,29 +946,7 @@ def _wait_for_silver_table(spark, path: str, timeout: int = 600, interval: int =
 
 
 def stream_silver_to_canonical(spark):
-    """
-    Stream all 5 source-specific Silver tables → silver_container_events.
 
-    Architecture:
-      - Each source stream is projected to the canonical schema via the
-        _project_*_to_canonical helpers above.
-      - The 5 projected streams are unioned into a single stream.
-      - foreachBatch performs a Delta MERGE ON event_id (idempotent upsert),
-        which guarantees exactly-once semantics across checkpoint restarts.
-      - Wall-clock time (current_timestamp) is used ONLY for canonical_ingest_time
-        (audit lineage) — never for business-logic columns.
-
-    Checkpoint safety:
-      - If the checkpoint is deleted and the job replays all Silver data,
-        the MERGE ON event_id prevents duplicate rows in the canonical table.
-      - If the canonical table does not yet exist (first run), the first batch
-        creates it with the canonical schema.
-
-    Silver contract enforced:
-      - Only rows where event_id IS NOT NULL AND container_id IS NOT NULL AND
-        event_type IS NOT NULL AND event_time IS NOT NULL AND facility IS NOT NULL
-        are written (matches Silver's hard-filter guarantees).
-    """
     logger.info("=" * 70)
     logger.info("Starting canonical Silver stream: silver_container_events")
     logger.info("=" * 70)
@@ -1259,10 +954,6 @@ def stream_silver_to_canonical(spark):
     canonical_path = "s3a://lakehouse/silver/silver_container_events"
     checkpoint_path = "s3a://checkpoints/silver_container_events"
 
-    # Wait for all 5 source Silver tables to be initialised before opening
-    # readStreams on them.  On a fresh deployment (empty MinIO) the
-    # Bronze→Silver micro-batches must complete at least once first —
-    # otherwise Delta raises DELTA_SCHEMA_NOT_SET.
     _silver_sources = [
         "s3a://lakehouse/silver/silver_gate_events",
         "s3a://lakehouse/silver/silver_yard_moves",
@@ -1291,10 +982,6 @@ def stream_silver_to_canonical(spark):
         spark.readStream.format("delta").load("s3a://lakehouse/silver/silver_mnr_events")
     )
 
-    # unionByName is required: all projectors must have identical column sets but
-    # positional union() would silently corrupt data if any projector is ever
-    # modified without updating all others.  allowMissingColumns=True makes this
-    # forward-compatible with schema evolution in individual source projectors.
     all_events = (gate
         .unionByName(yard,       allowMissingColumns=True)
         .unionByName(inspection, allowMissingColumns=True)

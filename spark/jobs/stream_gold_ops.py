@@ -4,7 +4,6 @@ Active output tables (all driven by two streaming queries):
 1. gold_container_cycle            — stateful cycle tracking (OPEN/CLOSED)
 2. gold_container_current_status   — incremental latest-status UPSERT
 3. gold_ops_metrics_realtime       — refreshed in foreachBatch of stream_container_cycles
-4. gold_backlog_metrics            — refreshed in foreachBatch of stream_current_status
 """
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -12,12 +11,10 @@ from pyspark.sql.functions import (
     lit,
     when,
     coalesce,
-    expr,
     current_timestamp,
     first,
     count,
     countDistinct,
-    sum as _sum,
     max as _max,
     min as _min,
     concat_ws,
@@ -29,7 +26,7 @@ from pyspark.sql.functions import (
 from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType, StructField, StringType, TimestampType, 
-    IntegerType, DoubleType, LongType
+    DoubleType
 )
 from delta.tables import DeltaTable
 import logging
@@ -38,8 +35,6 @@ import time
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Silver owns facility normalization. Gold trusts Silver's `facility` column (CTxx, non-null).
-# See stream_ingest_bronze_silver.py::normalize_facility for the canonical implementation.
 
 _CANONICAL_SILVER_PATH = "s3a://lakehouse/silver/silver_container_events"
 
@@ -64,12 +59,7 @@ def _wait_for_canonical_silver(spark, timeout: int = 600, interval: int = 15) ->
 
 
 def get_dataset_now_from_batch(batch_df):
-    """
-    Derive max(event_time_parsed) from the current micro-batch as the
-    analytics reference time for all dwell and metrics calculations.
-    Returns None only if every event in the batch has null event_time_parsed.
-    Callers must guard against None before using the value.
-    """
+
     row = batch_df.agg(_max("event_time_parsed").alias("max_ts")).collect()[0]
     return row["max_ts"]
 
@@ -116,7 +106,7 @@ def create_spark_session():
 
 
 # ==================== GOLD CONTAINER CYCLES (Stateful) ====================
-
+# matching GATE_IN and GATE_OUT events to build container cycles with dwell time calculations
 def upsert_cycles_to_delta(batch_df, batch_id):
     """
     Incremental MERGE for cycle updates (robust matching)
@@ -134,14 +124,13 @@ def upsert_cycles_to_delta(batch_df, batch_id):
     delta_path = "s3a://lakehouse/gold/gold_container_cycle"
 
     # Derive dataset_now from this batch so all dwell and metrics calculations
-    # are anchored to max(event_time_parsed) — never to wall-clock time.
-    batch_dataset_now = get_dataset_now_from_batch(batch_df)
+
+    batch_dataset_now = get_dataset_now_from_batch(batch_df) # max(event_time_parsed) in this batch, used for dwell calculations and metrics anchoring
     if batch_dataset_now is None:
         logger.warning(f"Batch {batch_id}: All events have null event_time_parsed; skipping cycle upsert")
         return
 
-    # facility is CTxx-normalized and non-null — guaranteed by Silver hard filter
-    # Create table if missing (schema-only)
+
     if not DeltaTable.isDeltaTable(spark, delta_path):
         logger.info(f"Creating new Gold Cycle table at {delta_path}")
         empty_schema_df = (batch_df.select(
@@ -172,14 +161,11 @@ def upsert_cycles_to_delta(batch_df, batch_id):
             col("facility"),
             col("event_time_parsed").alias("gate_in_time"),
             col("truck").alias("gate_in_truck"),
-            col("source_row")  # stable CSV row ID for cycle_id hashing
+            col("source_row")  
         )
         .where(col("facility").isNotNull() & (col("facility") != ""))
         .withColumn("gate_out_time", lit(None).cast("timestamp"))
         .withColumn("gate_out_truck", lit(None).cast("string"))
-        # Use source_row (stable across producer loops) instead of gate_in_time
-        # (remapped and slightly different every loop) so that re-published
-        # GATE_IN events produce the same cycle_id and the MERGE is idempotent.
         .withColumn("cycle_id", md5(concat_ws("|", col("container_no_norm"), col("source_row"), col("facility"))))
         .withColumn("cycle_status", lit("OPEN"))
         .withColumn("dwell_time_hours", lit(None).cast("double"))
@@ -189,7 +175,7 @@ def upsert_cycles_to_delta(batch_df, batch_id):
     )
 
     if not gate_ins.isEmpty():
-        logger.info(f"Batch {batch_id}: Inserting {gate_ins.count()} OPEN cycles (GATE_IN)")
+        logger.info(f"Batch {batch_id}: Inserting OPEN cycles (GATE_IN)")
         (delta_table.alias("target")
             .merge(gate_ins.alias("source"), "target.cycle_id = source.cycle_id")
             .whenNotMatchedInsertAll()
@@ -211,7 +197,6 @@ def upsert_cycles_to_delta(batch_df, batch_id):
     )
 
     if not gate_outs.isEmpty():
-        # Load current OPEN cycles snapshot
         open_cycles = (delta_table.toDF()
             .where(col("cycle_status") == "OPEN")
             .select("cycle_id", "container_no_norm", "facility", "gate_in_time", "gate_in_truck")
@@ -232,7 +217,7 @@ def upsert_cycles_to_delta(batch_df, batch_id):
         )
 
         if not candidates.isEmpty():
-            # Pick the most recent OPEN cycle for each OUT event
+            # If multiple OPEN cycles match the same OUT, keep the one with the latest gate_in_time (closest to out_time).
             w_out = Window.partitionBy("container_no_norm", "facility", "event_out_time").orderBy(col("gate_in_time").desc())
             matched = candidates.withColumn("rn", row_number().over(w_out)).where(col("rn") == 1).drop("rn")
 
@@ -257,7 +242,7 @@ def upsert_cycles_to_delta(batch_df, batch_id):
                 )
             )
 
-            logger.info(f"Batch {batch_id}: Closing {updates.count()} cycles (GATE_OUT matched)")
+            logger.info(f"Batch {batch_id}: Closing matched cycles (GATE_OUT)")
 
             (delta_table.alias("target")
                 .merge(updates.alias("source"), "target.cycle_id = source.cycle_id")
@@ -275,11 +260,10 @@ def upsert_cycles_to_delta(batch_df, batch_id):
                 .execute()
             )
         else:
-            logger.warning(f"Batch {batch_id}: No OPEN cycle matches found for {gate_outs.count()} GATE_OUT events (check facility/time alignment)")
+            logger.warning(f"Batch {batch_id}: No OPEN cycle matches found for GATE_OUT events (check facility/time alignment)")
 
     # 3) Refresh current_dwell_hours for ALL OPEN cycles.
-    # Anchored to batch_dataset_now so replaying the same data always
-    # produces the same dwell values (deterministic, not wall-clock dependent).
+
     try:
         batch_now_ts = lit(batch_dataset_now).cast("timestamp")
         refresh_src = (delta_table.toDF()
@@ -306,26 +290,12 @@ def upsert_cycles_to_delta(batch_df, batch_id):
     except Exception as e:
         logger.warning(f"Batch {batch_id}: Failed to refresh current_dwell_hours: {e}")
 
-    # Recompute derived ops metrics anchored to dataset_now (not wall clock)
     refresh_ops_metrics_from_cycles(spark, batch_id, batch_dataset_now)
 
 
 
 
 def refresh_ops_metrics_from_cycles(spark, batch_id, dataset_now):
-    """
-    Batch-read the full gold_container_cycle table and OVERWRITE
-    gold_ops_metrics_realtime with a single, fresh snapshot.
-
-    Replaces the old streaming query that used outputMode("complete") with
-    Delta format — which appended one snapshot per trigger instead of
-    replacing the previous one, causing SUM() in Superset to accumulate
-    across all historic snapshots.
-
-    dataset_now: max(event_time_parsed) from the triggering batch.
-    All dwell calculations and inventory bounds are anchored to this value
-    so the function is deterministic across replays — never wall-clock.
-    """
     try:
         delta_path = "s3a://lakehouse/gold/gold_ops_metrics_realtime"
         _DWELL_BUCKETS = ["FAST_0_48H", "MODERATE_49_120H", "SLOW_121_240H", "CRITICAL_GT240H"]
@@ -356,7 +326,6 @@ def refresh_ops_metrics_from_cycles(spark, batch_id, dataset_now):
             )
         )
 
-        # Dense grid: ensure all facility × dwell_bucket combos appear (0-fill missing ones)
         facilities_df = raw_df.select("facility").distinct()
         buckets_df = spark.createDataFrame([(b,) for b in _DWELL_BUCKETS], ["dwell_bucket"])
         dense_grid = facilities_df.crossJoin(buckets_df)
@@ -365,8 +334,8 @@ def refresh_ops_metrics_from_cycles(spark, batch_id, dataset_now):
             dense_grid.join(raw_df, ["facility", "dwell_bucket"], "left")
             .fillna({"container_count": 0, "max_dwell_hours": 0.0, "min_dwell_hours": 0.0})
             .withColumn("metric_type", lit("INVENTORY_BY_DWELL"))
-            .withColumn("metric_time", current_timestamp())    # audit: when computation ran
-            .withColumn("data_as_of", dataset_now_ts)           # business: max event_time in batch
+            .withColumn("metric_time", current_timestamp())    
+            .withColumn("data_as_of", dataset_now_ts)         
         )
 
         metrics_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(delta_path)
@@ -376,26 +345,9 @@ def refresh_ops_metrics_from_cycles(spark, batch_id, dataset_now):
 
 
 def refresh_backlog_metrics_from_status(spark, batch_id, dataset_now):
-    """
-    Batch-read the full gold_container_current_status table and OVERWRITE
-    gold_backlog_metrics with a single, fresh snapshot.
-
-    Fixes two issues present in the old streaming approach:
-    1. outputMode("complete") + Delta = append per trigger → counts inflated.
-    2. "NAN" string values passed isNotNull() → containers mis-classified as
-       WAITING_REPAIR even when no real inspection occurred.
-    """
     try:
         delta_path = "s3a://lakehouse/gold/gold_backlog_metrics"
 
-        # Only count containers currently in yard (open cycles) to avoid inflated backlog counts
-        # gold_container_current_status keeps ALL historical containers; without this join
-        # containers that already gated out are still counted as "waiting" → 3-4x inflation
-        # Use container_id (Silver-normalized form) from gold_container_cycle.
-        # Gold cycle stores container_no_norm which equals Silver's container_id.
-        # gold_container_current_status also stores container_no_norm from Silver.
-        # Extra guard: filter status to is_in_yard='true' (latest event != GATE_OUT)
-        # so even if the cycle join misses some rows, we don't count gated-out containers.
         open_containers = (
             spark.read.format("delta")
             .load("s3a://lakehouse/gold/gold_container_cycle")
@@ -407,72 +359,38 @@ def refresh_backlog_metrics_from_status(spark, batch_id, dataset_now):
         backlog_df = (
             spark.read.format("delta")
             .load("s3a://lakehouse/gold/gold_container_current_status")
-            # Primary guard: must be an OPEN cycle container
-            .join(open_containers,
-                  col("container_no_norm") == col("_open_cno"), how="inner")
+            .join(open_containers, col("container_no_norm") == col("_open_cno"), how="inner")
             .drop("_open_cno")
-            # Secondary guard: latest event must not be GATE_OUT
             .where(col("is_in_yard").cast("boolean") == True)
             .withColumn(
                 "backlog_type",
-                # Priority: IN_REPAIR > WAITING_REPAIR > WAITING_CLEANING > WAITING_INSPECTION
-                # IN_REPAIR: repair job open (estimate/auth/approval) — independent of inspection source.
-                # MNR and inspection come from separate CSV sources; require only last_repair_stage.
-                # Note: stage_norm normalizes APPROVAL → APPROVED in Silver, so both forms are
-                # listed here for backward-compatibility with any rows written before the fix.
                 when(
-                    col("last_repair_stage").isin("ESTIMATE", "AUTHORIZATION", "APPROVAL", "APPROVED"),
+                    col("last_inspection_severity").isin("MINOR", "MODERATE", "MAJOR", "CRITICAL", "SEVERE")
+                    & col("last_repair_stage").isin("APPROVAL", "APPROVED"),
                     lit("IN_REPAIR"),
                 )
-                # WAITING_REPAIR: damage found (severity known) but no repair job started yet
                 .when(
                     col("last_inspection_severity").isin("MINOR", "MODERATE", "MAJOR", "CRITICAL", "SEVERE")
-                    & col("last_repair_stage").isNull(),
+                    & (col("last_repair_stage").isNull() | col("last_repair_stage").isin("ESTIMATE", "AUTHORIZATION")),
                     lit("WAITING_REPAIR"),
                 )
-                # WAITING_CLEANING: repair completed (COMPLETED/REPAIRED) AND cleaning not yet done.
-                # 'CLEANING' = in-progress (not finished) → still counts as backlog.
-                # 'CLEAN' = finished → cleaning done, no backlog.
-                # NULL cleaning_type (never cleaned) must also be an explicit condition because
-                # in Spark SQL, NOT(NULL IN ('CLEAN')) evaluates to NULL — not TRUE — so the
-                # ~isin() tilde alone silently excluded the most common WAITING_CLEANING case
-                # (repair done, cleaning not yet started).
                 .when(
-                    col("last_repair_stage").isin("COMPLETED", "REPAIRED")
-                    & (col("last_cleaning_type").isNull() | ~col("last_cleaning_type").isin("CLEAN")),
-                    lit("WAITING_CLEANING"),
-                )
-                # Also catch containers whose last event is an in-progress cleaning
-                # (repair stage may be NULL when cleaning started independently)
-                .when(
-                    col("last_cleaning_type") == "CLEANING",
+                    col("last_cleaning_type").isin("CLEANING", "CLEAN"),
                     lit("IN_CLEANING"),
                 )
-                # WAITING_INSPECTION: no inspection record at all (never inspected since gate-in).
-                # 'NO_DEFECT' = inspected and no damage found → falls through to NO_BACKLOG.
-                .when(
-                    col("last_inspection_severity").isNull()
-                    & col("last_repair_stage").isNull()
-                    & col("last_cleaning_type").isNull(),
-                    lit("WAITING_INSPECTION"),
-                )
-                .otherwise(lit("NO_BACKLOG")),
+                .otherwise(lit("WAITING_INSPECTION")),
             )
-            .where(col("backlog_type") != "NO_BACKLOG")
             .where(col("facility").isNotNull())
             .groupBy("facility", "backlog_type")
-            # countDistinct ensures each container is counted once even if
-            # gold_container_current_status has duplicate rows (e.g. after stream restart).
-            # count("*") was the root cause of backlog_count > OPEN cycle count.
             .agg(countDistinct("container_no_norm").alias("backlog_count"))
-            .withColumn("metric_time", current_timestamp())            # audit: when computation ran
-            .withColumn("data_as_of", lit(dataset_now).cast("timestamp"))  # business: max event_time
+            .withColumn("metric_time", current_timestamp())
+            .withColumn("data_as_of", lit(dataset_now).cast("timestamp"))
         )
+
         backlog_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(delta_path)
         logger.info(f"Batch {batch_id}: Refreshed backlog metrics (overwrite)")
     except Exception as e:
         logger.warning(f"Batch {batch_id}: Failed to refresh backlog metrics: {e}")
-
 
 def stream_container_cycles(spark):
     """Stream container cycles from Silver gate events"""
@@ -496,15 +414,7 @@ def stream_container_cycles(spark):
         ])
     )
     
-    # Read GATE_IN / GATE_OUT events from canonical Silver (silver_container_events).
-    # Replaces the direct silver_gate_events read: canonical already holds all gate
-    # events with normalized event_type (GATE_IN / GATE_OUT — no variant strings).
-    #
-    # Column aliases map canonical names to the names expected by upsert_cycles_to_delta:
-    #   container_id  → container_no_norm
-    #   event_type    → event_type_norm  (canonical values only: GATE_IN / GATE_OUT)
-    #   event_time    → event_time_parsed (used by get_dataset_now_from_batch + upsert logic)
-    #   truck         → truck            (gate_in_truck / gate_out_truck in gold_container_cycle)
+
     gate_stream = (
         spark.readStream.format("delta")
         .load("s3a://lakehouse/silver/silver_container_events")
@@ -534,7 +444,7 @@ def stream_container_cycles(spark):
 
 
 # ==================== GOLD CURRENT STATUS (Incremental UPSERT) ====================
-
+# Các trạng thái mới nhất
 def build_current_status_batch(batch_df):
     """
     Build latest status per container from event batch
@@ -562,7 +472,7 @@ def build_current_status_batch(batch_df):
         .withColumn("last_repair_stage", col("last_repair_stage_coalesced"))
         .withColumn("last_cleaning_type", col("last_cleaning_type_coalesced"))
         .withColumn("is_in_yard",
-            (col("event_type_norm") != "GATE_OUT").cast("string"))  # canonical: GATE_OUT only
+            (col("event_type_norm") != "GATE_OUT").cast("string"))  
         .select(
             "container_no_norm",
             "event_time_parsed",
@@ -588,8 +498,8 @@ def upsert_current_status_to_delta(batch_df, batch_id):
     if batch_df.isEmpty():
         logger.info(f"Batch {batch_id}: No events for status update")
         return
-    
-    logger.info(f"Batch {batch_id}: Processing {batch_df.count()} events")
+
+    logger.info(f"Batch {batch_id}: Processing status updates")
     batch_dataset_now = get_dataset_now_from_batch(batch_df)
 
     # Build current status from this batch of events
@@ -598,25 +508,15 @@ def upsert_current_status_to_delta(batch_df, batch_id):
     if current_status.isEmpty():
         logger.info(f"Batch {batch_id}: No status updates generated")
         return
-    
-    logger.info(f"Batch {batch_id}: Generated {current_status.count()} status updates")
+
+    logger.info(f"Batch {batch_id}: Generated status updates")
     
     delta_path = "s3a://lakehouse/gold/gold_container_current_status"
     
     try:
         delta_table = DeltaTable.forPath(current_status.sparkSession, delta_path)
-        
-        # Count before merge
-        count_before = current_status.sparkSession.read.format("delta").load(delta_path).count()
-        num_updates = current_status.count()
-        
-        # MERGE: always apply, but advance the "latest event" pointer only if update is newer.
-        # Domain enrichment fields (severity, stage, cleaning, location) are ALWAYS coalesced
-        # so that late-arriving inspection/repair/cleaning events still enrich the row even
-        # when their timestamp is older than the most recent YARD_MOVE or GATE event.
-        # Root-cause fix: the old condition="updates.event_time_parsed > target.event_time_parsed"
-        # silently dropped the entire update block when e.g. a YARD_MOVE (14:00) arrived before
-        # an INSPECTION (11:00), leaving last_inspection_severity = NULL permanently.
+
+
         (delta_table.alias("target")
             .merge(
                 current_status.alias("updates"),
@@ -624,13 +524,10 @@ def upsert_current_status_to_delta(batch_df, batch_id):
             )
             .whenMatchedUpdate(
                 set={
-                    # Advance pointer only if update carries a newer event timestamp
                     "event_time_parsed": "CASE WHEN updates.event_time_parsed > target.event_time_parsed THEN updates.event_time_parsed ELSE target.event_time_parsed END",
                     "event_type_norm":   "CASE WHEN updates.event_time_parsed > target.event_time_parsed THEN updates.event_type_norm   ELSE target.event_type_norm   END",
                     "facility":          "CASE WHEN updates.event_time_parsed > target.event_time_parsed THEN updates.facility          ELSE target.facility          END",
                     "is_in_yard":        "CASE WHEN updates.event_time_parsed > target.event_time_parsed THEN CAST((updates.event_type_norm != 'GATE_OUT') AS STRING) ELSE target.is_in_yard END",
-                    # Domain enrichment: always coalesce – keep any non-null value regardless of
-                    # which event arrived first (fixes silent data loss for late-arriving events)
                     "last_location":            "coalesce(updates.last_location,            target.last_location)",
                     "last_inspection_severity": "coalesce(updates.last_inspection_severity, target.last_inspection_severity)",
                     "last_repair_stage":        "coalesce(updates.last_repair_stage,        target.last_repair_stage)",
@@ -641,22 +538,16 @@ def upsert_current_status_to_delta(batch_df, batch_id):
             .whenNotMatchedInsertAll()
             .execute()
         )
-        
-        # Count after merge and calculate stats
-        count_after = current_status.sparkSession.read.format("delta").load(delta_path).count()
-        num_inserts = count_after - count_before
-        num_matched = num_updates - num_inserts
-        
-        logger.info(f"Gold container_status - Batch: {batch_id} - MERGE: +{num_inserts} inserts, +{num_matched} updates")
 
+        logger.info(f"Gold container_status - Batch: {batch_id} - MERGE completed")
         logger.info(f"Batch {batch_id}: MERGE completed for current status")
         
     except Exception as e:
         logger.info(f"Batch {batch_id}: Creating new current status table")
         current_status.write.format("delta").mode("overwrite").save(delta_path)
 
-    # Recompute derived backlog metrics anchored to dataset_now (not wall clock)
-    refresh_backlog_metrics_from_status(current_status.sparkSession, batch_id, batch_dataset_now)
+    if batch_dataset_now is not None:
+        refresh_backlog_metrics_from_status(current_status.sparkSession, batch_id, batch_dataset_now)
 
 
 def stream_current_status(spark):
@@ -680,20 +571,7 @@ def stream_current_status(spark):
         ])
     )
 
-    # Single canonical stream replacing the previous 5-source manual union.
-    # silver_container_events already carries all per-source domain fields
-    # (to_location, damage_severity, mnr_stage, cleaning_type) with null for
-    # sources where they are not applicable — no per-source schema knowledge needed.
-    #
-    # Column aliases map canonical names to the names expected by
-    # build_current_status_batch and upsert_current_status_to_delta:
-    #   container_id     → container_no_norm
-    #   event_time       → event_time_parsed  (used by get_dataset_now_from_batch)
-    #   event_type       → event_type_norm    (canonical values — no variant strings)
-    #   to_location      → last_location      (non-null for YARD_MOVE only)
-    #   damage_severity  → last_inspection_severity (non-null for INSPECTION only)
-    #   mnr_stage        → last_repair_stage  (non-null for MNR only)
-    #   cleaning_type    → last_cleaning_type (non-null for CLEANING only)
+
     all_events = (
         spark.readStream.format("delta")
         .load("s3a://lakehouse/silver/silver_container_events")
@@ -732,16 +610,12 @@ def main():
         logger.info("Starting Gold Operational Streaming Layer")
         logger.info("=" * 60)
 
-        # Wait for spark-stream-canonical to write silver_container_events.
         _wait_for_canonical_silver(spark)
 
-        # Start all Gold streams
-        # Note: ops_metrics and backlog require cycles/current_status tables to exist first
         queries = [
             stream_container_cycles(spark),
             stream_current_status(spark),
-            # ops_metrics refreshed via refresh_ops_metrics_from_cycles() in upsert_cycles_to_delta foreachBatch
-            # backlog_metrics refreshed via refresh_backlog_metrics_from_status() in upsert_current_status_to_delta foreachBatch
+
         ]
         
         logger.info(f"Started {len(queries)} Gold operational streams")
@@ -749,7 +623,6 @@ def main():
         logger.info("Streams running. Press Ctrl+C to stop.")
         logger.info("=" * 60)
         
-        # Wait for termination
         spark.streams.awaitAnyTermination()
         
     except KeyboardInterrupt:

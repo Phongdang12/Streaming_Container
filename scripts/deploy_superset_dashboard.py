@@ -4,141 +4,30 @@ import time
 import os
 import warnings
 
-# Configuration
 SUPERSET_URL = "http://localhost:8088"
 USERNAME = "admin"
 PASSWORD = "admin"
 DB_NAME = "Trino Delta Lake"
 SCHEMA_NAME = "lakehouse"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRE-FLIGHT CHECK
-# All charts in this dashboard query Gold Delta tables via Trino.
-# Trino resolves tables through the Hive Metastore (HMS).
-# The Spark Gold jobs (stream_gold_ops.py, batch_kpi.py) register tables to HMS
-# ONLY when the environment variable HMS_REGISTER_ENABLED=true is set.
-#
-# If you see "table not found" errors in Superset after deploying this script:
-#   1. Restart Spark jobs with:  HMS_REGISTER_ENABLED=true
-#   2. Or manually register via:
-#        spark.sql("CREATE TABLE IF NOT EXISTS lakehouse.gold_container_cycle
-#                   USING DELTA LOCATION 's3a://lakehouse/gold/gold_container_cycle'")
-#      for each Gold table below.
-# ─────────────────────────────────────────────────────────────────────────────
-_REQUIRED_GOLD_TABLES = [
-    "gold_container_cycle",
-    "gold_container_current_status",
-    "gold_ops_metrics_realtime",
-    "gold_backlog_metrics",
-    "gold_kpi_shift",
-    "gold_kpi_daily",
-    "gold_kpi_peak_hours",
-    "gold_inspection_summary",
-    "gold_yard_move_summary",
-]
-
 if os.environ.get("HMS_REGISTER_ENABLED", "false").lower() != "true":
     warnings.warn(
-        "\n[deploy_superset_dashboard] HMS_REGISTER_ENABLED is NOT set to 'true'.\n"
-        "Gold tables are not registered in Hive Metastore → Trino cannot resolve them.\n"
-        "All Superset charts will fail with 'Table not found'.\n"
-        "Set HMS_REGISTER_ENABLED=true in your Spark job environment before deploying.",
+        "[deploy_superset_dashboard] HMS_REGISTER_ENABLED is not 'true'; Superset queries may fail with table not found.",
         stacklevel=2,
     )
 
-# =============================================================================
-# DASHBOARD AUTO-REFRESH
-# ─────────────────────────────────────────────────────────────────────────────
-# refresh_frequency = 30 seconds → Superset re-queries Gold tables every 30s.
-# This is set in json_metadata when create_dashboard() is called and is
-# persisted in the Superset database — no manual setup needed.
 DASHBOARD_REFRESH_SECONDS = 30
 
-# =============================================================================
-# LAYOUT ROWS
-# Each tuple: (height_px, n_charts) in order matching CHARTS_CONFIG below.
-# Grid is 48 columns wide; width per chart = 48 // n_charts.
-# ─────────────────────────────────────────────────────────────────────────────
-#   Row 0: 4 KPI Scorecards (short — height 26)
-#   Row 1: 3 Throughput & Inventory charts
-#   Row 2: 2 Damage & Quality charts
-#   Row 3: 2 Yard & Repair charts
-#   Row 4: 3 Shift & Peak Analytics charts
-#   Row 5: 1 Escalation table (tall — height 72)
-# =============================================================================
 LAYOUT_TABS = {
-    "Trang chính": [],
-    "Operations": [],
-    "Diagnostics": []
+    "Trang chính": [
+        (26, 2),
+        (38, 4),
+        (38, 3),
+        (72, 1),
+    ]
 }
 
-# =============================================================================
-# CHARTS CONFIGURATION
-# Layout (15 charts across 6 rows — order must match LAYOUT_ROWS above):
-#
-#   Row 0: 4 KPI Scorecards
-#            Total In Yard | Critical Dwell >240h | Avg Dwell (all-time closed) | Total Backlog
-#
-#   Row 1: Throughput & Inventory
-#            1.1 Daily Gate Throughput — Last 30 Days (trend line, dataset-relative window)
-#            1.2 Inventory by Dwell Risk — per Facility (stacked bar — FAST→CRITICAL, bottom→top)
-#            1.3 Operational Backlog by Type (bar)
-#
-#   Row 2: Damage & Quality
-#            Inspection Damage Severity (bar — MINOR/MAJOR/CRITICAL only)
-#            Damage Code × Component Heatmap (heatmap)
-#
-#   Row 3: Yard & Repair Operations
-#            3.1 Yard Move Reason Breakdown (bar)
-#            3.2 REHANDLE Rate % by Facility (big_number / bar — % of all moves that are re-handles)
-#            3.3 Active MNR Pipeline — by Facility & Stage (bar — active/in-yard only, ESTIMATE→REPAIRED)
-#
-#   Row 4: Shift & Peak Analytics
-#            Gate-In vs Gate-Out by Shift (grouped bar — 3 shifts)
-#            Gate Activity Peak Hour Heatmap (heatmap)
-#            Gate-In Volume by Facility (stacked bar)
-#
-#   Row 5: Exception Alerts
-#            Escalation List: Warning Dwell >120h (table)
-# =============================================================================
 CHARTS_CONFIG = [
-    {
-        "slice_name": "KPI: Total Operational Backlog",
-        "viz_type": "big_number_total",
-        "datasource_name": "gold_backlog_metrics",
-        "params": {
-            "metric": {
-                "expressionType": "SIMPLE",
-                "column": {"column_name": "backlog_count"},
-                "aggregate": "SUM",
-                "label": "Total Backlog"
-            },
-            "subheader": "waiting repair \u00b7 in repair \u00b7 waiting clean \u00b7 waiting inspect"
-        }
-    },
-    {
-        "slice_name": "KPI: Avg Completed Dwell (hours)",
-        "viz_type": "big_number_total",
-        "datasource_name": "gold_container_cycle",
-        "params": {
-            "metric": {
-                "expressionType": "SIMPLE",
-                "column": {"column_name": "dwell_time_hours"},
-                "aggregate": "AVG",
-                "label": "Avg Dwell (hrs)"
-            },
-            "adhoc_filters": [
-                {
-                    "expressionType": "SIMPLE",
-                    "subject": "cycle_status",
-                    "operator": "==",
-                    "comparator": "CLOSED",
-                    "clause": "WHERE"
-                }
-            ],
-            "subheader": "average dwell per closed container cycle"
-        }
-    },
     {
         "slice_name": "KPI: Critical Dwell (>240h)",
         "viz_type": "big_number_total",
@@ -164,7 +53,7 @@ CHARTS_CONFIG = [
                     "clause": "WHERE"
                 }
             ],
-            "subheader": "dwell > 240h \u2014 immediate intervention required"
+            "subheader": "dwell > 240h — immediate intervention required"
         }
     },
     {
@@ -191,8 +80,6 @@ CHARTS_CONFIG = [
         }
     },
     {
-        # Issue fix →1.1: add dataset-relative 30-day window to prevent empty lefthand axis space.
-        # Subquery is evaluated at query time against the same table (Trino scalar subquery).
         "slice_name": "1.1 Daily Gate Throughput — Last 30 Days",
         "viz_type": "line",
         "datasource_name": "gold_kpi_daily_30d",
@@ -218,10 +105,6 @@ CHARTS_CONFIG = [
         }
     },
     {
-        # Issue fix →1.2: Superset dist_bar cannot sort x-axis categories by custom logic.
-        # Workaround: swap groupby↔columns so dwell_bucket becomes the series dimension,
-        # which CAN be ordered via timeseries_limit_metric (CASE WHEN sort key 1–4).
-        # Result: x-axis = facilities; stacked segments ordered FAST(bottom)→CRITICAL(top).
         "slice_name": "1.2 Inventory by Dwell Risk — per Facility",
         "viz_type": "dist_bar",
         "datasource_name": "gold_ops_metrics_realtime",
@@ -250,52 +133,6 @@ CHARTS_CONFIG = [
         }
     },
     {
-        # Issue fix →5.1: reduce to 4 focused columns + computed severity band;
-        # rename columns via column_config; tighten row_limit and timestamp format.
-        "slice_name": "5.1 Escalation List: Overdue Containers (>120h Dwell)",
-        "viz_type": "table",
-        "datasource_name": "gold_container_cycle",
-        "params": {
-            "all_columns": [
-                "container_no_norm", "facility",
-                "current_dwell_hours", "gate_in_time"
-            ],
-            "adhoc_columns": [
-                {
-                    "expressionType": "SQL",
-                    "sqlExpression": "CASE WHEN current_dwell_hours > 240 THEN 'CRITICAL' ELSE 'WARNING' END",
-                    "label": "Severity Band",
-                    "column_name": "severity_band"
-                }
-            ],
-            "column_config": {
-                "container_no_norm": {"label": "Container No"},
-                "facility":          {"label": "Facility"},
-                "current_dwell_hours": {"label": "Dwell (hrs)", "d3NumberFormat": ".1f"},
-                "gate_in_time":      {"label": "Gate-In Time"},
-                "Severity Band":     {"label": "Severity"}
-            },
-            "order_by_cols": ["current_dwell_hours"],
-            "order_desc": True,
-            "adhoc_filters": [
-                {
-                    "expressionType": "SIMPLE",
-                    "subject": "cycle_status",
-                    "operator": "==",
-                    "comparator": "OPEN",
-                    "clause": "WHERE"
-                },
-                {
-                    "expressionType": "SQL",
-                    "sqlExpression": "current_dwell_hours > 120",
-                    "clause": "WHERE"
-                }
-            ],
-            "row_limit": 50,
-            "table_timestamp_format": "%Y-%m-%d %H:%M"
-        }
-    },
-    {
         "slice_name": "1.3 Operational Backlog by Type",
         "viz_type": "dist_bar",
         "datasource_name": "gold_backlog_metrics",
@@ -315,117 +152,14 @@ CHARTS_CONFIG = [
             "adhoc_filters": [
                 {
                     "expressionType": "SQL",
-                    "sqlExpression": "backlog_type IN ('WAITING_INSPECTION', 'WAITING_REPAIR', 'IN_REPAIR', 'WAITING_CLEANING', 'IN_CLEANING')",
+                    "sqlExpression": "backlog_type IN ('WAITING_INSPECTION', 'WAITING_REPAIR', 'IN_REPAIR', 'IN_CLEANING')",
                     "clause": "WHERE"
                 }
             ]
         }
     },
     {
-        # 3.2 — REHANDLE Rate % per facility (overall, all dates combined)
-        # REHANDLE = unproductive move (container moved to make room for another).
-        # High REHANDLE rate (>15%) = yard congestion, poor slot planning → increased costs.
-        # Formula: SUM(REHANDLE moves) / SUM(all moves) × 100  per facility.
-        # No date breakdown — shows single bar per facility for a clean comparison.
-        "slice_name": "3.2 REHANDLE Rate % by Facility",
-        "viz_type": "dist_bar",
-        "datasource_name": "gold_yard_move_summary",
-        "params": {
-            "metrics": [
-                {
-                    "expressionType": "SQL",
-                    "sqlExpression": (
-                        "100.0 * SUM(CASE WHEN move_reason = 'REHANDLE' THEN move_count ELSE 0 END) "
-                        "/ NULLIF(SUM(move_count), 0)"
-                    ),
-                    "label": "REHANDLE Rate %"
-                }
-            ],
-            "groupby": ["facility"],
-            "columns": [],
-            "show_legend": False,
-            "show_bar_value": True,
-            "y_axis_label": "REHANDLE Rate (%)",
-            "y_axis_format": ".1f",
-            "adhoc_filters": [
-                {
-                    "expressionType": "SQL",
-                    "sqlExpression": "move_reason IS NOT NULL",
-                    "clause": "WHERE"
-                }
-            ],
-            "color_scheme": "bnbColors"
-        }
-    },
-    {
-        # Issue fix →3.3: same x-axis ordering problem as 1.2. Swap groupby↔columns
-        # so last_repair_stage becomes the series dimension, ordered via
-        # timeseries_limit_metric CASE WHEN lifecycle sort (ESTIMATE=1→REPAIRED=4).
-        # Result: x-axis = facilities; grouped bars ordered by MNR lifecycle left→right.
-        "slice_name": "3.3 Active MNR Pipeline — by Facility & Stage",
-        "viz_type": "dist_bar",
-        "datasource_name": "gold_container_current_status",
-        "params": {
-            "metrics": [
-                {
-                    "expressionType": "SIMPLE",
-                    "column": {"column_name": "container_no_norm"},
-                    "aggregate": "COUNT_DISTINCT",
-                    "label": "Containers in Repair"
-                }
-            ],
-            "groupby": ["facility"],
-            "columns": ["last_repair_stage"],
-            "timeseries_limit": 5,
-            "timeseries_limit_metric": {
-                "expressionType": "SQL",
-                "sqlExpression": "MIN(CASE WHEN last_repair_stage = 'ESTIMATE' THEN 1 WHEN last_repair_stage = 'AUTHORIZATION' THEN 2 WHEN last_repair_stage = 'APPROVED' THEN 3 WHEN last_repair_stage = 'REPAIRED' THEN 4 ELSE 5 END)",
-                "label": "StageSortKey"
-            },
-            "order_desc": False,
-            "adhoc_filters": [
-                {
-                    "expressionType": "SQL",
-                    "sqlExpression": "last_repair_stage IS NOT NULL AND last_repair_stage NOT LIKE 'UNKNOWN%' AND is_in_yard = 'true'",
-                    "clause": "WHERE"
-                }
-            ],
-            "show_legend": True,
-            "y_axis_label": "Active Containers in Repair (in-yard only)"
-        }
-    },
-    {
-        # Issue fix →4.1: rename to clarify dataset-scope aggregate (not daily trend);
-        # add show_bar_value so absolute counts are visible on each bar.
-        "slice_name": "4.1 Gate-In vs Gate-Out by Shift (Dataset Total)",
-        "viz_type": "dist_bar",
-        "datasource_name": "gold_kpi_shift",
-        "params": {
-            "metrics": [
-                {
-                    "expressionType": "SIMPLE",
-                    "column": {"column_name": "value"},
-                    "aggregate": "SUM",
-                    "label": "Total Events"
-                }
-            ],
-            "groupby": ["shift_id"],
-            "columns": ["kpi_type"],
-            "adhoc_filters": [
-                {
-                    "expressionType": "SQL",
-                    "sqlExpression": "kpi_type IN ('SHIFT_GATE_IN', 'SHIFT_GATE_OUT')",
-                    "clause": "WHERE"
-                }
-            ],
-            "y_axis_label": "Cumulative gate events across full dataset",
-            "show_legend": True,
-            "show_bar_value": True,
-            "rich_tooltip": True
-        }
-    },
-    {
-        "slice_name": "4.3 Gate-In Volume by Facility",
+        "slice_name": "4.3 Gate-In Volume by Facility — Last 180 Days",
         "viz_type": "dist_bar",
         "datasource_name": "gold_kpi_shift",
         "params": {
@@ -454,62 +188,7 @@ CHARTS_CONFIG = [
         }
     },
     {
-        # Issue fix →4.2: three sub-fixes:
-        #   1. SUM(avg_activity) inflated scale when multiple facilities present → AVG
-        #   2. blue_white_yellow washes out mid-range values → oranges (0→orange gradient)
-        #   3. normalize_across="heatmap" creates binary look if one cell dominates;
-        #      "y" normalises per-row (per day) so peak hours show relative to each day's
-        #      activity level — correct semantics for a "peak hour" heatmap.
-        #   4. day_name now uses "1-Mon"…"7-Sun" prefix (set in batch_kpi.py)
-        #      so alphabetical sort ≡ correct weekday order Mon→Sun.
-        "slice_name": "4.2 Gate Activity Peak Hour Heatmap",
-        "viz_type": "heatmap",
-        "datasource_name": "gold_kpi_peak_hours",
-        "params": {
-            "all_columns_x": "hour_of_day",
-            "all_columns_y": "day_name",
-            "metric": {
-                "expressionType": "SIMPLE",
-                "column": {"column_name": "avg_activity"},
-                "aggregate": "AVG",
-                "label": "Avg Gate Activity"
-            },
-            "linear_color_scheme": "oranges",
-            "xscale_interval": "1",
-            "yscale_interval": "1",
-            "canvas_image_rendering": "pixelated",
-            "normalize_across": "y",
-            "show_legend": True
-        }
-    },
-    {
-        "slice_name": "3.1 Yard Move Reason Breakdown",
-        "viz_type": "dist_bar",
-        "datasource_name": "gold_yard_move_summary",
-        "params": {
-            "metrics": [
-                {
-                    "expressionType": "SIMPLE",
-                    "column": {"column_name": "move_count"},
-                    "aggregate": "SUM",
-                    "label": "Move Count"
-                }
-            ],
-            "groupby": ["move_reason"],
-            "columns": ["facility"],
-            "show_legend": True,
-            "y_axis_label": "Total Moves",
-            "adhoc_filters": [
-                {
-                    "expressionType": "SQL",
-                    "sqlExpression": "move_reason IS NOT NULL",
-                    "clause": "WHERE"
-                }
-            ]
-        }
-    },
-    {
-        "slice_name": "2.1 Inspection Damage Severity Distribution",
+        "slice_name": "2.1 Inspection Damage Severity Distribution — Last 90 Days",
         "viz_type": "dist_bar",
         "datasource_name": "gold_inspection_summary",
         "params": {
@@ -535,10 +214,7 @@ CHARTS_CONFIG = [
         }
     },
     {
-        # Issue fix →2.2: strengthen null filter to catch Python 'nan' strings; add
-        # left_margin for long component label readability; switch to YlOrRd which
-        # provides a yellow→red gradient (better than blue_white_yellow for frequency maps).
-        "slice_name": "2.2 Damage Code vs Component Heatmap",
+        "slice_name": "2.2 Damage Code vs Component Heatmap — Last 90 Days",
         "viz_type": "heatmap",
         "datasource_name": "gold_inspection_summary",
         "params": {
@@ -567,14 +243,90 @@ CHARTS_CONFIG = [
             ]
         }
     },
+    {
+        "slice_name": "3.1 Yard Move Reason Breakdown — Last 60 Days",
+        "viz_type": "dist_bar",
+        "datasource_name": "gold_yard_move_summary",
+        "params": {
+            "metrics": [
+                {
+                    "expressionType": "SIMPLE",
+                    "column": {"column_name": "move_count"},
+                    "aggregate": "SUM",
+                    "label": "Move Count"
+                }
+            ],
+            "groupby": ["move_reason"],
+            "columns": ["facility"],
+            "show_legend": True,
+            "y_axis_label": "Total Moves",
+            "adhoc_filters": [
+                {
+                    "expressionType": "SQL",
+                    "sqlExpression": "move_reason IS NOT NULL",
+                    "clause": "WHERE"
+                }
+            ]
+        }
+    },
+    {
+        "slice_name": "5.1 Completed & Departed Containers — Last 30 Days",
+        "viz_type": "table",
+        "datasource_name": "gold_container_current_status",
+        "params": {
+            "all_columns": [
+                "container_no_norm",
+                "facility",
+                "event_time_parsed",
+                "last_inspection_severity",
+                "last_repair_stage",
+                "last_cleaning_type"
+            ],
+            "column_config": {
+                "container_no_norm": {"label": "Container No"},
+                "facility": {"label": "Facility"},
+                "event_time_parsed": {"label": "Gate-Out Time"},
+                "last_inspection_severity": {"label": "Inspection Severity"},
+                "last_repair_stage": {"label": "Repair Stage"},
+                "last_cleaning_type": {"label": "Cleaning Type"}
+            },
+            "order_by_cols": ["event_time_parsed"],
+            "order_desc": True,
+            "adhoc_filters": [
+                {
+                    "expressionType": "SIMPLE",
+                    "subject": "event_type_norm",
+                    "operator": "==",
+                    "comparator": "GATE_OUT",
+                    "clause": "WHERE"
+                },
+                {
+                    "expressionType": "SIMPLE",
+                    "subject": "is_in_yard",
+                    "operator": "==",
+                    "comparator": "false",
+                    "clause": "WHERE"
+                },
+                {
+                    "expressionType": "SQL",
+                    "sqlExpression": "(last_repair_stage IS NULL OR last_repair_stage IN ('COMPLETED', 'REPAIRED'))",
+                    "clause": "WHERE"
+                },
+                {
+                    "expressionType": "SQL",
+                    "sqlExpression": "(last_cleaning_type IS NULL OR last_cleaning_type IN ('CLEAN'))",
+                    "clause": "WHERE"
+                }
+            ],
+            "row_limit": 100,
+            "table_timestamp_format": "%Y-%m-%d %H:%M"
+        }
+    }
 ]
-
 DASHBOARD_TITLE = "Container Operations Control Tower"
 DASHBOARD_SLUG = "container-ops-tower"
 
-# Virtual (SQL-based) datasets — subqueries are allowed here, not in chart filters
 VIRTUAL_DATASETS = {
-    # Pre-filters to the last 30 simulation days so chart 1.1 needs no subquery filter
     "gold_kpi_daily_30d": (
         "SELECT * FROM lakehouse.gold_kpi_daily "
         "WHERE kpi_type = 'DAILY_THROUGHPUT' "
@@ -591,7 +343,6 @@ REQUIRED_TABLES = [
     "gold_backlog_metrics",
     "gold_kpi_shift",
     "gold_kpi_daily",
-    "gold_kpi_peak_hours",
     "gold_inspection_summary",
     "gold_yard_move_summary",
 ]
@@ -638,7 +389,6 @@ class SupersetClient:
         return None
 
     def get_or_create_dataset(self, db_id, table_name, schema):
-        # Check if exists
         url = f"{self.base_url}/api/v1/dataset/?q=(filters:!((col:table_name,opr:eq,value:'{table_name}'),(col:schema,opr:eq,value:'{schema}')))"
         res = self.session.get(url).json()
         if res.get('count', 0) > 0:
@@ -700,7 +450,6 @@ class SupersetClient:
             return None
 
     def create_chart(self, chart_config, dataset_id):
-        # Check if exists (simple check by title)
         title = chart_config['slice_name']
         url = f"{self.base_url}/api/v1/chart/?q=(filters:!((col:slice_name,opr:eq,value:'{title}')))"
         res = self.session.get(url).json()
@@ -737,9 +486,7 @@ class SupersetClient:
 
     @staticmethod
     def _build_position_json(chart_infos: list, layout_tabs: dict) -> dict:
-        """
-        Build Superset position_json with tabs.
-        """
+        """Build Superset position_json with tabs."""
         position = {
             "ROOT_ID": {
                 "type": "ROOT", "id": "ROOT_ID",
@@ -820,18 +567,7 @@ class SupersetClient:
         return position
 
     def create_dashboard(self, title, slug, chart_infos: list):
-        """
-        Create or update dashboard.
-
-        chart_infos: list of (chart_id, slice_name) | None in CHARTS_CONFIG order.
-                     None = chart was skipped (dataset unavailable); position_json
-                     builder handles these gracefully — row alignment is preserved.
-        Sets:
-          - json_metadata.refresh_frequency → auto-refresh every N seconds
-          - position_json                   → charts laid out per LAYOUT_ROWS
-          - published = True
-        """
-        # ── Find or create ─────────────────────────────────────────────────
+        """Create or update dashboard with the configured layout and refresh."""
         url = (f"{self.base_url}/api/v1/dashboard/"
                f"?q=(filters:!((col:dashboard_title,opr:eq,value:'{title}')))")
         res          = self.session.get(url).json()
@@ -854,7 +590,6 @@ class SupersetClient:
                 print(f"  Error creating dashboard: {r.text}")
                 return
 
-        # ── Build layout & metadata ────────────────────────────────────────
         position_json = self._build_position_json(chart_infos, LAYOUT_TABS)
 
         json_metadata = {
@@ -866,7 +601,6 @@ class SupersetClient:
             "cross_filters_enabled":     False,
         }
 
-        # ── PUT update (idempotent — works on both new and existing) ────────
         try:
             r = self.session.put(
                 f"{self.base_url}/api/v1/dashboard/{dashboard_id}",
@@ -900,7 +634,6 @@ def main():
 
     print("\nRegistering Datasets...")
     dataset_ids = {}
-    # Use REQUIRED_TABLES so every table is registered even if a chart was skipped.
     tables = set(REQUIRED_TABLES) | set(c['datasource_name'] for c in CHARTS_CONFIG) - set(VIRTUAL_DATASETS.keys())
     for table in sorted(tables):
         ds_id = client.get_or_create_dataset(db_id, table, SCHEMA_NAME)
@@ -921,7 +654,6 @@ def main():
         ds_id = dataset_ids.get(table_name)
         if not ds_id:
             skipped.append(config['slice_name'])
-            # Insert a placeholder so row layout stays aligned with LAYOUT_ROWS
             created_chart_infos.append(None)
             continue
         chart_id = client.create_chart(config, ds_id)
@@ -936,19 +668,17 @@ def main():
     valid_count = sum(1 for c in created_chart_infos if c is not None)
 
     print("\nCreating Dashboard...")
-    # Pass the full list (including None placeholders) so _build_position_json
-    # can maintain correct row-to-chart alignment even when some charts were skipped.
     client.create_dashboard(DASHBOARD_TITLE, DASHBOARD_SLUG, created_chart_infos)
 
     print(f"\n✅ Done — {valid_count} charts deployed.")
     print("→ Open http://localhost:8088/superset/dashboard/container-ops-tower/")
     print("\nDashboard layout (drag & drop to arrange):")
-    print("  Row 0: 4× KPI Scorecards (inventory | critical dwell >240h | avg dwell | backlog)")
-    print("  Row 1: Daily throughput trend | Dwell risk stacked bar | Backlog by type")
-    print("  Row 2: Damage severity bar (MINOR/MAJOR/CRITICAL) | Damage code\u00d7component heatmap")
-    print("  Row 3: Yard move reason bar | MNR pipeline (active in-yard containers only)")
-    print("  Row 4: Gate-In vs Gate-Out by shift | Peak hour heatmap | Gate-in by facility")
-    print("  Row 5: Escalation list \u2014 warning dwell >48h (pre-critical watchlist)")
+    print("  Row 0: Critical dwell KPI | Total in-yard KPI")
+    print("  Row 1: Daily throughput | Dwell risk by facility | Backlog by type | Gate-in volume by facility")
+    print("  Row 2: Damage severity | Damage code\u00d7component | Yard move reason")
+    print("  Row 3: Completed & departed containers table")
 
 if __name__ == "__main__":
     main()
+
+

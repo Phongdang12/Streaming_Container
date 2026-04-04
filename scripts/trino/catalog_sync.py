@@ -23,7 +23,6 @@ TABLES_WHITELIST = {
     "gold_backlog_metrics",
     "gold_kpi_shift",
     "gold_kpi_daily",
-    "gold_kpi_peak_hours",
     "gold_inspection_summary",
     "gold_yard_move_summary",
 }

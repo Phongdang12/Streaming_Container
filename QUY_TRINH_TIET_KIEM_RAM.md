@@ -39,17 +39,6 @@ Chạy các service nền tảng (Kafka, MinIO, Trino, HMS, Superset).
 *   **Chờ đợi**: Khoảng 2-3 phút cho đến khi script báo "INFRASTRUCTURE STATUS".
 *   **Kiểm tra**: Mở Spark UI: **http://localhost:8080** và Superset: **http://localhost:8088** để xác nhận dịch vụ đã sẵn sàng.
 
----
-
-
-docker-compose run --rm producer-stream python producer.py `
-  --mode loop --reset-sim `
-  --interval 0 `
-  --inter-event-delay 0 `
-  --sim-data-start 2025-12-01
-# ✅ Xong trong ~3 phút
-
-
 ## 🏭 BƯỚC 2: SINH DỮ LIỆU & XỬ LÝ TẦNG ĐẦU (BRONZE/SILVER)
 
 Thay vì chạy tất cả, ta chỉ chạy Producer và Spark Job xử lý dữ liệu thô.
@@ -57,7 +46,7 @@ Thay vì chạy tất cả, ta chỉ chạy Producer và Spark Job xử lý dữ
 1.  **Chạy Producer** (Gửi dữ liệu vào Kafka):
     ```powershell
     docker-compose up -d producer-stream
-    docker-compose up producer-stream
+    docker-compose logs -f producer-stream
 
     ```
 

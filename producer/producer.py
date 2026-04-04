@@ -15,7 +15,7 @@ import os
 import sys
 import time
 import argparse
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import re
 import pandas as pd
@@ -175,6 +175,26 @@ class ContainerEventProducer:
         m = re.search(r"(CT\d{2})", s)
         return m.group(1) if m else "UNKNOWN"
 
+    @staticmethod
+    def _normalize_mnr_stage(value: str) -> str:
+        """Normalize raw MNR stage variants to canonical stage labels."""
+        stage = str(value or "").strip().upper()
+        if stage == "APPROVAL":
+            return "APPROVED"
+        if stage == "COMPLETED":
+            return "REPAIRED"
+        return stage
+
+    @staticmethod
+    def _derive_mnr_event_type(stage_value: str) -> str:
+        """Derive producer event_type from stage so CSV event_type is optional."""
+        stage = ContainerEventProducer._normalize_mnr_stage(stage_value)
+        if stage == "REPAIRED":
+            return "MNR_REPAIRED"
+        if stage == "APPROVED":
+            return "MNR_APPROVED"
+        return "MNR_RECEIVED"
+
     
     # Map event types to Kafka topics
     TOPIC_MAPPING = {
@@ -289,13 +309,16 @@ class ContainerEventProducer:
             
             topic = self.TOPIC_MAPPING[event_type]
             container_no = str(row.get('container_no_raw', ''))
+            position_value = str(row.get('position', ''))
+            location_value = str(row.get('location', ''))
+            facility_value = self._extract_ct_facility(location_value)
+            if facility_value == "UNKNOWN":
+                facility_value = self._extract_ct_facility(position_value)
             
             event = {
                 'event_id': f"GATE_{str(row.get('source_file', os.path.basename(filepath)))}_{str(row.get('source_row', idx))}",
                 'event_type': event_type,
                 'event_time': _norm_ts(row.get('event_time', '')),
-                'date_raw': str(row.get('date_raw', '')),
-                'time_raw': str(row.get('time_raw', '')),
                 'container_no_raw': container_no,
                 'eir': str(row.get('eir', '')),
                 'seq': str(row.get('seq', '')),
@@ -308,11 +331,11 @@ class ContainerEventProducer:
                 'voyage': str(row.get('voyage', '')),
                 'dest': str(row.get('dest', '')),
                 'grade': str(row.get('grade', '')),
-                'position': str(row.get('position', '')),
-                'location': str(row.get('location', '')),
+                'position': position_value,
+                'location': location_value,
                 'remark': str(row.get('remark', '')),
                 'nominate_remark': str(row.get('nominate_remark', '')),
-                'facility': self._extract_ct_facility(str(row.get('location', ''))),
+                'facility': facility_value,
                 'source_file': str(row.get('source_file', os.path.basename(filepath))),
                 'source_sheet': str(row.get('source_sheet', '')),
                 'source_row': str(row.get('source_row', idx)),
@@ -348,20 +371,17 @@ class ContainerEventProducer:
                 'event_id': f"CLEAN_{str(row.get('source_file', os.path.basename(filepath)))}_{str(row.get('source_row', idx))}",
                 'event_type': event_type,
                 'event_time': _norm_ts(row.get('event_time', '')),
-                'date_in': str(row.get('Date In', row.get('Date_In', ''))),
                 'container_no_raw': container_no,
                 'type_raw': str(row.get('type_raw', '')),
                 'remark_raw': str(row.get('remark_raw', '')),
-                'amount': str(row.get('amount', '')),
+                'amount': str(row.get('cost', row.get('amount', ''))),
+                'currency': str(row.get('currency', 'USD')),
                 'facility': self._extract_ct_facility(str(row.get('facility', ''))),
                 'source_file': str(row.get('source_file', os.path.basename(filepath))),
                 'source_sheet': str(row.get('source_sheet', '')),
                 'source_row': str(row.get('source_row', idx)),
                 'is_synthetic': str(row.get('is_synthetic', '0'))
             }
-            # If event_time missing, fallback to date_in
-            if not str(event.get('event_time', '')).strip():
-                event['event_time'] = str(event.get('date_in', '')).strip()
 
             if self.publish_event(topic, event, container_no):
                 published_count += 1
@@ -381,11 +401,9 @@ class ContainerEventProducer:
         
         published_count = 0
         for idx, row in df.iterrows():
-            event_type = str(row.get('event_type', 'MNR_RECEIVED')).strip()
-            if event_type not in self.TOPIC_MAPPING:
-                event_type = 'MNR_RECEIVED'
-            
-            topic = self.TOPIC_MAPPING.get(event_type, 'raw.mnr')
+            stage_value = str(row.get('stage', ''))
+            event_type = self._derive_mnr_event_type(stage_value)
+            topic = 'raw.mnr'
             container_no = str(row.get('container_no_raw', ''))
             
             event = {
@@ -395,12 +413,8 @@ class ContainerEventProducer:
                 'container_no_raw': container_no,
                 'size_raw': str(row.get('size_raw', '')),
                 'location_raw': str(row.get('location_raw', '')),
-                'amount_raw': str(row.get('amount_raw', '')),
-                'cleaning_cost_raw': str(row.get('cleaning_cost_raw', '')),
-                'repair_cost_raw': str(row.get('repair_cost_raw', '')),
-                'discount_raw': str(row.get('discount_raw', '')),
                 'note_raw': str(row.get('note_raw', '')),
-                'stage': str(row.get('stage', '')),
+                'stage': self._normalize_mnr_stage(stage_value),
                 'facility': self._extract_ct_facility(str(row.get('location_raw', ''))),
                 'source_file': str(row.get('source_file', os.path.basename(filepath))),
                 'source_sheet': str(row.get('source_sheet', '')),
@@ -548,12 +562,11 @@ class ContainerEventProducer:
             df['_event_time'] = pd.to_datetime(df['event_time'], errors='coerce')
             frames.append(df)
 
-        # Cleaning  (primary: event_time, fallback: Date In)
+        # Cleaning
         df = self.load_csv_data(self.DATA_FILES['cleaning'])
         if not df.empty:
             df['_source_type'] = 'cleaning'
-            ts_col = df['event_time'] if 'event_time' in df.columns else df.get('Date In', pd.Series())
-            df['_event_time'] = pd.to_datetime(ts_col, errors='coerce')
+            df['_event_time'] = pd.to_datetime(df['event_time'], errors='coerce')
             frames.append(df)
 
         # M&R
@@ -613,8 +626,6 @@ class ContainerEventProducer:
                 'event_id':          f"GATE_{str(row.get('source_file', 'gate'))}_{str(row.get('source_row', idx))}",
                 'event_type':        event_type,
                 'event_time':        event_time_str,
-                'date_raw':          str(row.get('date_raw', '')),
-                'time_raw':          str(row.get('time_raw', '')),
                 'container_no_raw':  container_no,
                 'eir':               str(row.get('eir', '')),
                 'seq':               str(row.get('seq', '')),
@@ -647,11 +658,11 @@ class ContainerEventProducer:
                 'event_id':         f"CLEAN_{str(row.get('source_file', 'cleaning'))}_{str(row.get('source_row', idx))}",
                 'event_type':       event_type,
                 'event_time':       event_time_str,
-                'date_in':          str(row.get('Date In', row.get('Date_In', ''))),
                 'container_no_raw': container_no,
                 'type_raw':         str(row.get('type_raw', '')),
                 'remark_raw':       str(row.get('remark_raw', '')),
-                'amount':           str(row.get('amount', '')),
+                'amount':           str(row.get('cost', row.get('amount', ''))),
+                'currency':         str(row.get('currency', 'USD')),
                 'facility':         self._extract_ct_facility(str(row.get('facility', ''))),
                 'source_file':      str(row.get('source_file', 'cleaning')),
                 'source_sheet':     str(row.get('source_sheet', '')),
@@ -661,10 +672,9 @@ class ContainerEventProducer:
             # topic already set above via TOPIC_MAPPING lookup — no second assignment needed
 
         elif source_type == 'mnr':
-            event_type = str(row.get('event_type', 'MNR_RECEIVED')).strip()
-            if event_type not in self.TOPIC_MAPPING:
-                event_type = 'MNR_RECEIVED'
-            topic = self.TOPIC_MAPPING.get(event_type, 'raw.mnr')
+            stage_value = str(row.get('stage', ''))
+            event_type = self._derive_mnr_event_type(stage_value)
+            topic = 'raw.mnr'
             event = {
                 'event_id':           f"MNR_{str(row.get('source_file', 'mnr'))}_{str(row.get('source_row', idx))}",
                 'event_type':         event_type,
@@ -672,12 +682,8 @@ class ContainerEventProducer:
                 'container_no_raw':   container_no,
                 'size_raw':           str(row.get('size_raw', '')),
                 'location_raw':       str(row.get('location_raw', '')),
-                'amount_raw':         str(row.get('amount_raw', '')),
-                'cleaning_cost_raw':  str(row.get('cleaning_cost_raw', '')),
-                'repair_cost_raw':    str(row.get('repair_cost_raw', '')),
-                'discount_raw':       str(row.get('discount_raw', '')),
                 'note_raw':           str(row.get('note_raw', '')),
-                'stage':              str(row.get('stage', '')),
+                'stage':              self._normalize_mnr_stage(stage_value),
                 'facility':           self._extract_ct_facility(str(row.get('location_raw', ''))),
                 'source_file':        str(row.get('source_file', 'mnr')),
                 'source_sheet':       str(row.get('source_sheet', '')),
