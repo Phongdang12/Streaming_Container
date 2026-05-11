@@ -16,9 +16,135 @@ from pyspark.sql.types import (
 from delta.tables import DeltaTable
 import logging
 import time
+import os
+import math
+import hashlib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ==================== BLOOM FILTER HELPERS ====================
+class InMemoryBloomFilter:
+    """Simple in-memory Bloom filter for batch pre-filtering."""
+
+    def __init__(self, expected_items: int = 300000, false_positive_rate: float = 0.01):
+        self.expected_items = max(1000, int(expected_items))
+        fp_rate = min(max(false_positive_rate, 1e-6), 0.25)
+        bit_count = int(-(self.expected_items * math.log(fp_rate)) / (math.log(2) ** 2))
+        self.bit_count = max(8192, bit_count)
+        hash_count = int((self.bit_count / self.expected_items) * math.log(2))
+        self.hash_count = max(2, hash_count)
+        self.byte_size = (self.bit_count + 7) // 8
+        self.bits = bytearray(self.byte_size)
+        self.item_count = 0
+
+    def _positions(self, key: str):
+        payload = key.encode("utf-8", errors="ignore")
+        digest = hashlib.sha256(payload).digest()
+        seed_a = int.from_bytes(digest[:16], "big")
+        seed_b = int.from_bytes(digest[16:], "big") or 1
+        for i in range(self.hash_count):
+            yield (seed_a + i * seed_b) % self.bit_count
+
+    def add(self, key: str) -> None:
+        if not key:
+            return
+        for pos in self._positions(key):
+            byte_idx = pos // 8
+            bit_idx = pos % 8
+            self.bits[byte_idx] |= (1 << bit_idx)
+        self.item_count += 1
+
+    def might_contain(self, key: str) -> bool:
+        if not key:
+            return False
+        for pos in self._positions(key):
+            byte_idx = pos // 8
+            bit_idx = pos % 8
+            if not (self.bits[byte_idx] & (1 << bit_idx)):
+                return False
+        return True
+
+    def clear(self) -> None:
+        self.bits = bytearray(self.byte_size)
+        self.item_count = 0
+
+
+def _create_empty_like(df):
+    return df.limit(0)
+
+
+def merge_with_bloom_prefilter(clean_df, silver_path: str, key_col: str, bloom: InMemoryBloomFilter, batch_id: int, stream_name: str):
+    """
+    Use Bloom filter as a pre-check before Delta MERGE:
+      - Definitely new keys: merge directly.
+      - Probable duplicates: verify via anti-join against target Delta table.
+    """
+    spark = clean_df.sparkSession
+    key_rows = clean_df.select(key_col).where(col(key_col).isNotNull()).dropDuplicates([key_col]).collect()
+    keys = [r[key_col] for r in key_rows if r[key_col] is not None]
+    if not keys:
+        logger.info(f"  {stream_name} batch {batch_id}: No keys to merge")
+        return
+
+    definitely_new_keys = []
+    probable_duplicate_keys = []
+    for key in keys:
+        if bloom.might_contain(key):
+            probable_duplicate_keys.append(key)
+        else:
+            definitely_new_keys.append(key)
+
+    definitely_new_df = _create_empty_like(clean_df) if not definitely_new_keys else clean_df.where(col(key_col).isin(definitely_new_keys))
+    probable_duplicate_df = _create_empty_like(clean_df) if not probable_duplicate_keys else clean_df.where(col(key_col).isin(probable_duplicate_keys))
+
+    verified_new_df = _create_empty_like(clean_df)
+    if probable_duplicate_keys:
+        try:
+            target_ids = spark.read.format("delta").load(silver_path).select(key_col).dropDuplicates([key_col])
+            probable_keys_df = spark.createDataFrame([(k,) for k in probable_duplicate_keys], [key_col])
+            existing_probable = target_ids.join(probable_keys_df, on=key_col, how="inner")
+            verified_new_df = probable_duplicate_df.join(existing_probable, on=key_col, how="left_anti")
+        except Exception:
+            # First run or target not created yet -> treat probable duplicates as new.
+            verified_new_df = probable_duplicate_df
+
+    final_to_merge = definitely_new_df.unionByName(verified_new_df)
+    merge_count = final_to_merge.count()
+
+    if merge_count == 0:
+        logger.info(
+            f"  {stream_name} batch {batch_id}: all filtered as duplicates "
+            f"(keys={len(keys)}, probable_dup={len(probable_duplicate_keys)})"
+        )
+        return
+
+    try:
+        dt = DeltaTable.forPath(spark, silver_path)
+        (dt.alias("t")
+           .merge(final_to_merge.alias("s"), f"t.{key_col} = s.{key_col}")
+           .whenNotMatchedInsertAll()
+           .execute())
+    except Exception:
+        final_to_merge.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_path)
+
+    inserted_rows = final_to_merge.select(key_col).where(col(key_col).isNotNull()).dropDuplicates([key_col]).collect()
+    for row in inserted_rows:
+        bloom.add(row[key_col])
+
+    # Keep FP controlled over long runs by rotating bloom state.
+    if bloom.item_count >= bloom.expected_items:
+        logger.info(f"  {stream_name}: rotating Bloom filter state after {bloom.item_count} keys")
+        bloom.clear()
+        for row in inserted_rows:
+            bloom.add(row[key_col])
+
+    logger.info(
+        f"  {stream_name} batch {batch_id}: total_keys={len(keys)}, "
+        f"definitely_new={len(definitely_new_keys)}, probable_dup={len(probable_duplicate_keys)}, "
+        f"merge_rows={merge_count}"
+    )
 
 
 # ==================== SCHEMAS ====================
@@ -411,6 +537,10 @@ def stream_bronze_to_silver_gate(spark):
 
     silver_path = "s3a://lakehouse/silver/silver_gate_events"
     checkpoint_path = "s3a://checkpoints/silver_gate_events"
+    bloom = InMemoryBloomFilter(
+        expected_items=int(os.getenv("SILVER_BLOOM_EXPECTED_ITEMS", "300000")),
+        false_positive_rate=float(os.getenv("SILVER_BLOOM_FP_RATE", "0.01")),
+    )
 
     # ===== BATCH CALLBACK =====
     def log_silver_batch(batch_df, batch_id):
@@ -427,14 +557,9 @@ def stream_bronze_to_silver_gate(spark):
         logger.info(f"    ├─ Null containers: {null_containers}")
         logger.info(f"    ├─ Null timestamps: {null_times}")
         logger.info(f"    └─ Null event types: {null_events}")
-        try:
-            dt = DeltaTable.forPath(clean.sparkSession, silver_path)
-            (dt.alias("t")
-               .merge(clean.alias("s"), "t.event_id_generated = s.event_id_generated")
-               .whenNotMatchedInsertAll()
-               .execute())
-        except Exception:
-            clean.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_path)
+        merge_with_bloom_prefilter(
+            clean, silver_path, "event_id_generated", bloom, batch_id, "silver_gate"
+        )
     
     query = (final_stream.writeStream
         .foreachBatch(log_silver_batch)
@@ -469,6 +594,10 @@ def stream_bronze_to_silver_yard_move(spark):
 
     silver_path = "s3a://lakehouse/silver/silver_yard_moves"
     checkpoint_path = "s3a://checkpoints/silver_yard_moves"
+    bloom = InMemoryBloomFilter(
+        expected_items=int(os.getenv("SILVER_BLOOM_EXPECTED_ITEMS", "300000")),
+        false_positive_rate=float(os.getenv("SILVER_BLOOM_FP_RATE", "0.01")),
+    )
 
     def log_silver_batch(batch_df, batch_id):
         clean = batch_df.dropDuplicates(["event_id_generated"])
@@ -476,14 +605,9 @@ def stream_bronze_to_silver_yard_move(spark):
         if count == 0:
             return
         logger.info(f"Silver yard_move - Batch {batch_id}: {count} records")
-        try:
-            dt = DeltaTable.forPath(clean.sparkSession, silver_path)
-            (dt.alias("t")
-               .merge(clean.alias("s"), "t.event_id_generated = s.event_id_generated")
-               .whenNotMatchedInsertAll()
-               .execute())
-        except Exception:
-            clean.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_path)
+        merge_with_bloom_prefilter(
+            clean, silver_path, "event_id_generated", bloom, batch_id, "silver_yard_move"
+        )
     
     query = (silver_stream.writeStream
         .foreachBatch(log_silver_batch)
@@ -530,6 +654,10 @@ def stream_bronze_to_silver_inspection(spark):
 
     silver_path = "s3a://lakehouse/silver/silver_inspections"
     checkpoint_path = "s3a://checkpoints/silver_inspections"
+    bloom = InMemoryBloomFilter(
+        expected_items=int(os.getenv("SILVER_BLOOM_EXPECTED_ITEMS", "300000")),
+        false_positive_rate=float(os.getenv("SILVER_BLOOM_FP_RATE", "0.01")),
+    )
 
     def log_silver_batch(batch_df, batch_id):
         clean = batch_df.dropDuplicates(["event_id_generated"])
@@ -537,14 +665,9 @@ def stream_bronze_to_silver_inspection(spark):
         if count == 0:
             return
         logger.info(f"Silver inspection - Batch {batch_id}: {count} records")
-        try:
-            dt = DeltaTable.forPath(clean.sparkSession, silver_path)
-            (dt.alias("t")
-               .merge(clean.alias("s"), "t.event_id_generated = s.event_id_generated")
-               .whenNotMatchedInsertAll()
-               .execute())
-        except Exception:
-            clean.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_path)
+        merge_with_bloom_prefilter(
+            clean, silver_path, "event_id_generated", bloom, batch_id, "silver_inspection"
+        )
     
     query = (silver_stream.writeStream
         .foreachBatch(log_silver_batch)
@@ -583,6 +706,10 @@ def stream_bronze_to_silver_cleaning(spark):
 
     silver_path = "s3a://lakehouse/silver/silver_cleaning_events"
     checkpoint_path = "s3a://checkpoints/silver_cleaning_events"
+    bloom = InMemoryBloomFilter(
+        expected_items=int(os.getenv("SILVER_BLOOM_EXPECTED_ITEMS", "300000")),
+        false_positive_rate=float(os.getenv("SILVER_BLOOM_FP_RATE", "0.01")),
+    )
 
     def log_silver_batch(batch_df, batch_id):
         clean = batch_df.dropDuplicates(["event_id_generated"])
@@ -590,14 +717,9 @@ def stream_bronze_to_silver_cleaning(spark):
         if count == 0:
             return
         logger.info(f"Silver cleaning - Batch {batch_id}: {count} records")
-        try:
-            dt = DeltaTable.forPath(clean.sparkSession, silver_path)
-            (dt.alias("t")
-               .merge(clean.alias("s"), "t.event_id_generated = s.event_id_generated")
-               .whenNotMatchedInsertAll()
-               .execute())
-        except Exception:
-            clean.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_path)
+        merge_with_bloom_prefilter(
+            clean, silver_path, "event_id_generated", bloom, batch_id, "silver_cleaning"
+        )
     
     query = (silver_stream.writeStream
         .foreachBatch(log_silver_batch)
@@ -638,6 +760,10 @@ def stream_bronze_to_silver_mnr(spark):
 
     silver_path = "s3a://lakehouse/silver/silver_mnr_events"
     checkpoint_path = "s3a://checkpoints/silver_mnr_events"
+    bloom = InMemoryBloomFilter(
+        expected_items=int(os.getenv("SILVER_BLOOM_EXPECTED_ITEMS", "300000")),
+        false_positive_rate=float(os.getenv("SILVER_BLOOM_FP_RATE", "0.01")),
+    )
 
     def log_silver_batch(batch_df, batch_id):
         clean = batch_df.dropDuplicates(["event_id_generated"])
@@ -645,14 +771,9 @@ def stream_bronze_to_silver_mnr(spark):
         if count == 0:
             return
         logger.info(f"Silver mnr - Batch {batch_id}: {count} records")
-        try:
-            dt = DeltaTable.forPath(clean.sparkSession, silver_path)
-            (dt.alias("t")
-               .merge(clean.alias("s"), "t.event_id_generated = s.event_id_generated")
-               .whenNotMatchedInsertAll()
-               .execute())
-        except Exception:
-            clean.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_path)
+        merge_with_bloom_prefilter(
+            clean, silver_path, "event_id_generated", bloom, batch_id, "silver_mnr"
+        )
     
     query = (silver_stream.writeStream
         .foreachBatch(log_silver_batch)

@@ -14,7 +14,7 @@ from pyspark.sql.functions import (
     current_timestamp,
     first,
     count,
-    countDistinct,
+    approx_count_distinct,
     max as _max,
     min as _min,
     concat_ws,
@@ -382,7 +382,9 @@ def refresh_backlog_metrics_from_status(spark, batch_id, dataset_now):
             )
             .where(col("facility").isNotNull())
             .groupBy("facility", "backlog_type")
-            .agg(countDistinct("container_no_norm").alias("backlog_count"))
+            .agg(
+                approx_count_distinct("container_no_norm", rsd=0.02).alias("backlog_count")
+            )
             .withColumn("metric_time", current_timestamp())
             .withColumn("data_as_of", lit(dataset_now).cast("timestamp"))
         )

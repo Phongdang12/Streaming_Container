@@ -1,12 +1,13 @@
+name: streaming_container
+
 services:
   # Kafka (KRaft mode - no ZooKeeper needed)
   kafka:
     image: apache/kafka:3.7.0
-    container_name: kafka
     hostname: kafka
     ports:
-      - "9092:9092"
-      - "9093:9093"
+      - "19092:9092"
+      - "19093:9093"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -39,11 +40,10 @@ services:
   # MinIO S3-compatible storage
   minio:
     image: minio/minio:latest
-    container_name: minio
     hostname: minio
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "19000:9000"
+      - "19001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -61,7 +61,6 @@ services:
   # MinIO client for bucket initialization
   minio-init:
     image: minio/mc:latest
-    container_name: minio-init
     depends_on:
       minio:
         condition: service_healthy
@@ -80,7 +79,6 @@ services:
   # Kafka topic initialization
   kafka-init:
     image: apache/kafka:3.7.0
-    container_name: kafka-init
     depends_on:
       kafka:
         condition: service_healthy
@@ -100,12 +98,11 @@ services:
   # Kafka UI for monitoring
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
     depends_on:
       kafka:
         condition: service_healthy
     ports:
-      - "8090:8080"
+      - "29090:8080"
     environment:
       - KAFKA_CLUSTERS_0_NAME=local
       - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
@@ -116,11 +113,10 @@ services:
   # Spark Master
   spark-master:
     image: apache/spark:3.5.0
-    container_name: spark-master
     hostname: spark-master
     ports:
-      - "8080:8080"  # Spark Master UI (required)
-      - "7077:7077"  # Spark Master port (required)
+      - "28080:8080"  # Spark Master UI (required)
+      - "17077:7077"  # Spark Master port (required)
     command: /opt/spark/sbin/start-master.sh
     environment:
       - SPARK_NO_DAEMONIZE=true
@@ -140,7 +136,6 @@ services:
   # Spark Worker (SCALED UP)
   spark-worker:
     image: apache/spark:3.5.0
-    container_name: spark-worker
     depends_on:
       spark-master:
         condition: service_healthy
@@ -161,7 +156,6 @@ services:
     build:
       context: ./spark
       dockerfile: Dockerfile
-    container_name: spark-submit
     depends_on:
       spark-master:
         condition: service_healthy
@@ -189,7 +183,6 @@ services:
     build:
       context: ./spark
       dockerfile: Dockerfile
-    container_name: spark-stream-bronze-silver
     depends_on:
       spark-master:
         condition: service_healthy
@@ -245,7 +238,6 @@ services:
     build:
       context: ./spark
       dockerfile: Dockerfile
-    container_name: spark-stream-gold-ops
     depends_on:
       spark-master:
         condition: service_healthy
@@ -299,7 +291,6 @@ services:
     build:
       context: ./spark
       dockerfile: Dockerfile
-    container_name: spark-kpi-batch
     depends_on:
       spark-master:
         condition: service_healthy
@@ -355,10 +346,9 @@ services:
   # Trino Coordinator
   trino:
     image: trinodb/trino:435
-    container_name: trino
     hostname: trino
     ports:
-      - "8081:8080"
+      - "28081:8080"
     depends_on:
       minio:
         condition: service_healthy
@@ -381,7 +371,6 @@ services:
   # PostgreSQL for Superset metadata
   postgres:
     image: postgres:15-alpine
-    container_name: postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -399,7 +388,6 @@ services:
   # PostgreSQL for Hive Metastore
   metastore-db:
     image: postgres:15-alpine
-    container_name: metastore-db
     environment:
       POSTGRES_DB: metastore
       POSTGRES_USER: hive
@@ -419,7 +407,6 @@ services:
     build:
       context: ./hive
       dockerfile: Dockerfile
-    container_name: hive-metastore
     environment:
       - METASTORE_DB_TYPE=postgres
       - METASTORE_DB_HOSTNAME=metastore-db
@@ -428,7 +415,7 @@ services:
       - METASTORE_DB_USER=hive
       - METASTORE_DB_PASSWORD=hive123
     ports:
-      - "9083:9083"
+      - "19083:9083"
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "9083"]
       interval: 10s
@@ -444,7 +431,6 @@ services:
   # Trino init (register Delta tables in HMS)
   trino-init:
     image: python:3.11-slim
-    container_name: trino-init
     depends_on:
       trino:
         condition: service_healthy
@@ -469,7 +455,6 @@ services:
   # Catalog sync (optional, periodic registration)
   catalog-sync:
     image: python:3.11-slim
-    container_name: catalog-sync
     depends_on:
       trino:
         condition: service_healthy
@@ -495,7 +480,6 @@ services:
   # Redis for Superset caching
   redis:
     image: redis:7-alpine
-    container_name: redis
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -509,10 +493,9 @@ services:
     build:
       context: ./superset
       dockerfile: Dockerfile
-    container_name: superset
     hostname: superset
     ports:
-      - "8088:8088"
+      - "28088:8088"
     depends_on:
       postgres:
         condition: service_healthy
@@ -545,7 +528,6 @@ services:
     build:
       context: ./superset
       dockerfile: Dockerfile
-    container_name: superset-init
     depends_on:
       superset:
         condition: service_healthy
@@ -561,7 +543,7 @@ services:
       - ./superset/superset_config.py:/app/pythonpath/superset_config.py
       - superset-data:/app/superset_home
     entrypoint: /bin/bash
-    command: /scripts/init-superset.sh
+    command: -c "sed -i 's/\\r$//' /scripts/init-superset.sh && /scripts/init-superset.sh"
     networks:
       - lakehouse
 
@@ -571,7 +553,6 @@ services:
     build:
       context: ./producer
       dockerfile: Dockerfile
-    container_name: producer
     depends_on:
       kafka:
         condition: service_healthy
@@ -590,7 +571,6 @@ services:
     build:
       context: ./producer
       dockerfile: Dockerfile
-    container_name: producer-stream
     depends_on:
       kafka:
         condition: service_healthy

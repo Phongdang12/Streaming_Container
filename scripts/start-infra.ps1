@@ -75,9 +75,9 @@ Write-Host ""
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "URLs:" -ForegroundColor Cyan
-Write-Host "  Superset:  http://localhost:8088 (admin/admin)" -ForegroundColor White
-Write-Host "  Kafka UI:  http://localhost:8090" -ForegroundColor White
-Write-Host "  MinIO:     http://localhost:9001 (minioadmin/minioadmin123)" -ForegroundColor White
-Write-Host "  Trino:     http://localhost:8081" -ForegroundColor White
-Write-Host "  Spark UI:  http://localhost:8080" -ForegroundColor White
+Write-Host "  Superset:  http://localhost:28088 (admin/admin)" -ForegroundColor White
+Write-Host "  Kafka UI:  http://localhost:29090" -ForegroundColor White
+Write-Host "  MinIO:     http://localhost:19001 (minioadmin/minioadmin123)" -ForegroundColor White
+Write-Host "  Trino:     http://localhost:28081" -ForegroundColor White
+Write-Host "  Spark UI:  http://localhost:28080" -ForegroundColor White
 Write-Host "========================================" -ForegroundColor Cyan

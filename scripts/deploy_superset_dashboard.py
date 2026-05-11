@@ -2,9 +2,10 @@ import requests
 import json
 import time
 import os
+import sys
 import warnings
 
-SUPERSET_URL = "http://localhost:8088"
+SUPERSET_URL = os.environ.get("SUPERSET_URL", "http://localhost:28088")
 USERNAME = "admin"
 PASSWORD = "admin"
 DB_NAME = "Trino Delta Lake"
@@ -17,6 +18,10 @@ if os.environ.get("HMS_REGISTER_ENABLED", "false").lower() != "true":
     )
 
 DASHBOARD_REFRESH_SECONDS = 30
+
+if hasattr(sys.stdout, "reconfigure"):
+    # Prevent Windows cp1252 console encoding from crashing on Unicode log symbols.
+    sys.stdout.reconfigure(errors="replace")
 
 LAYOUT_TABS = {
     "Trang chính": [
@@ -671,7 +676,7 @@ def main():
     client.create_dashboard(DASHBOARD_TITLE, DASHBOARD_SLUG, created_chart_infos)
 
     print(f"\n✅ Done — {valid_count} charts deployed.")
-    print("→ Open http://localhost:8088/superset/dashboard/container-ops-tower/")
+    print(f"→ Open {SUPERSET_URL}/superset/dashboard/container-ops-tower/")
     print("\nDashboard layout (drag & drop to arrange):")
     print("  Row 0: Critical dwell KPI | Total in-yard KPI")
     print("  Row 1: Daily throughput | Dwell risk by facility | Backlog by type | Gate-in volume by facility")

@@ -106,7 +106,7 @@ Lúc này dữ liệu đã nằm an toàn trong MinIO (ổ cứng). Ta không c�
     ```
 
 2.  **Tận hưởng**:
-    *   Truy cập Superset: **http://localhost:8088** (admin / admin).
+    *   Truy cập Superset: **http://localhost:28088** (admin / admin).
     *   Vẽ biểu đồ, query thoải mái mà máy tính vẫn mượt mà.
 
 
